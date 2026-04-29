@@ -1,0 +1,22 @@
+{
+  "name": "nexifyterm",
+  "version": "0.1.0",
+  "description": "NexifyTerm - macOS native terminal with AI integration",
+  "private": true,
+  "scripts": {
+    "setup": "xcodegen generate && xcodebuild -project NexOperator.xcodeproj -scheme NexOperator -resolvePackageDependencies && echo '✅ Setup complete'",
+    "generate": "xcodegen generate",
+    "build": "xcodegen generate && xcodebuild -project NexOperator.xcodeproj -scheme NexOperator -configuration Debug SYMROOT=$(pwd)/build CODE_SIGN_IDENTITY='' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO 2>&1 | tail -30",
+    "build:release": "xcodegen generate && xcodebuild -project NexOperator.xcodeproj -scheme NexOperator -configuration Release SYMROOT=$(pwd)/build -allowProvisioningUpdates 2>&1 | tail -30",
+    "dev": "bash scripts/dev-watch.sh",
+    "dev:once": "npm run build && open build/Debug/NexifyTerm.app",
+    "start": "npm run build:release && open build/Release/NexifyTerm.app",
+    "clean": "xcodebuild -project NexOperator.xcodeproj -scheme NexOperator clean 2>&1 | tail -5 && rm -rf build/ && echo '✅ Clean done'",
+    "rebuild": "npm run clean && npm run build",
+    "logs": "ls -lt ~/Library/Application\\ Support/NexOperator/logs/ 2>/dev/null | head -10 || echo 'No session logs yet'",
+    "logs:last": "cat \"$(ls -t ~/Library/Application\\ Support/NexOperator/logs/session_*.md 2>/dev/null | head -1)\" 2>/dev/null || echo 'No session logs yet'",
+    "logs:open": "open ~/Library/Application\\ Support/NexOperator/logs/ 2>/dev/null || echo 'No logs directory yet'",
+    "build:verbose": "xcodegen generate && xcodebuild -project NexOperator.xcodeproj -scheme NexOperator -configuration Debug SYMROOT=$(pwd)/build CODE_SIGN_IDENTITY='' CODE_SIGNING_REQUIRED=NO CODE_SIGNING_ALLOWED=NO 2>&1 | tee build.log",
+    "build:dmg": "npm run build:release && bash scripts/build-dmg.sh"
+  }
+}

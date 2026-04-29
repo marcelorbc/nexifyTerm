@@ -1,0 +1,104 @@
+name: NexOperator
+options:
+  bundleIdPrefix: com.nexia
+  deploymentTarget:
+    macOS: "14.0"
+  defaultConfig: Release
+  createIntermediateGroups: true
+
+packages:
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm
+    from: "1.0.0"
+
+targets:
+  NexifyTermWidget:
+    type: app-extension
+    platform: macOS
+    sources: [NexifyTermWidget]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nexia.nexifyterm.widget
+        PRODUCT_NAME: NexifyTermWidget
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
+    info:
+      path: NexifyTermWidget/Info.plist
+    entitlements:
+      path: NexifyTermWidget/NexifyTermWidget.entitlements
+
+  NexOperator:
+    type: application
+    platform: macOS
+    sources: [NexOperator]
+    dependencies:
+      - package: SwiftTerm
+      - target: NexifyTermWidget
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.nexia.nexifyterm
+        PRODUCT_NAME: NexifyTerm
+        MARKETING_VERSION: "0.1.0"
+        CURRENT_PROJECT_VERSION: "1"
+        SWIFT_VERSION: "5"
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+      configs:
+        Debug:
+          SWIFT_OPTIMIZATION_LEVEL: "-Onone"
+          CODE_SIGN_IDENTITY: ""
+          CODE_SIGNING_REQUIRED: "NO"
+          CODE_SIGNING_ALLOWED: "NO"
+        Release:
+          SWIFT_OPTIMIZATION_LEVEL: "-O"
+    info:
+      path: NexOperator/Resources/Info.plist
+      properties:
+        CFBundleName: NexifyTerm
+        CFBundleDisplayName: NexifyTerm
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        CFBundleURLTypes:
+          - CFBundleURLName: "com.nexia.nexifyterm.oauth"
+            CFBundleURLSchemes:
+              - nexifyterm
+        CFBundlePackageType: APPL
+        CFBundleExecutable: "$(EXECUTABLE_NAME)"
+        CFBundleIdentifier: "$(PRODUCT_BUNDLE_IDENTIFIER)"
+        LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
+        NSPrincipalClass: NSApplication
+        NSAppleEventsUsageDescription: "NexOperator precisa controlar outros aplicativos para automação do sistema."
+        NSContactsUsageDescription: "NexOperator pode precisar acessar contatos para operações do sistema."
+        NSCalendarsUsageDescription: "NexOperator pode precisar acessar calendários para operações do sistema."
+        NSLocationUsageDescription: "NexOperator pode precisar da localização para configurações de rede e sistema."
+        NSPhotoLibraryUsageDescription: "NexOperator pode precisar acessar fotos para operações do sistema."
+        NSBluetoothAlwaysUsageDescription: "NexOperator pode precisar do Bluetooth para diagnósticos de dispositivos."
+        NSSystemAdministrationUsageDescription: "NexOperator precisa de privilégios administrativos para gerenciar configurações do sistema."
+        NSServices:
+          - NSMessage: openInNexifyTerm
+            NSMenuItem:
+              default: "Open in NexifyTerm"
+            NSSendTypes:
+              - NSFilenamesPboardType
+              - public.file-url
+            NSReturnTypes: []
+    entitlements:
+      path: NexOperator/Resources/NexOperator.entitlements
+      properties:
+        com.apple.security.app-sandbox: false
+        com.apple.security.network.client: true
+        com.apple.security.network.server: true
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.files.downloads.read-write: true
+        com.apple.security.automation.apple-events: true
+        com.apple.security.device.usb: true
+        com.apple.security.device.bluetooth: true
+        com.apple.security.personal-information.addressbook: true
+        com.apple.security.personal-information.calendars: true
+        com.apple.security.personal-information.location: true
+        com.apple.security.personal-information.photos-library: true
+        com.apple.security.application-groups:
+          - group.com.nexia.nexifyterm

@@ -1,0 +1,45 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#42A5F5"/>
+      <stop offset="50%" style="stop-color:#1E88E5"/>
+      <stop offset="100%" style="stop-color:#0D47A1"/>
+    </linearGradient>
+    <linearGradient id="shine" x1="50%" y1="0%" x2="50%" y2="60%">
+      <stop offset="0%" style="stop-color:rgba(255,255,255,0.25)"/>
+      <stop offset="100%" style="stop-color:rgba(255,255,255,0)"/>
+    </linearGradient>
+    <filter id="shadow" x="-5%" y="-5%" width="110%" height="115%">
+      <feDropShadow dx="0" dy="8" stdDeviation="16" flood-color="#000" flood-opacity="0.3"/>
+    </filter>
+  </defs>
+
+  <g filter="url(#shadow)">
+    <path d="M512 60c195 0 296 0 377.6 56.4S960 249 960 512s-14 296-70.4 377.6S775 960 512 960s-296-14-377.6-70.4S60 775 60 512s14-296 70.4-377.6S249 60 512 60z" fill="url(#bg)"/>
+    <path d="M512 60c195 0 296 0 377.6 56.4S960 249 960 512s-14 296-70.4 377.6S775 960 512 960s-296-14-377.6-70.4S60 775 60 512s14-296 70.4-377.6S249 60 512 60z" fill="url(#shine)"/>
+  </g>
+
+  <!-- Terminal window frame -->
+  <rect x="222" y="240" width="580" height="420" rx="24" ry="24" fill="rgba(0,0,0,0.3)"/>
+  <rect x="222" y="240" width="580" height="56" rx="24" ry="24" fill="rgba(0,0,0,0.2)"/>
+  <rect x="222" y="272" width="580" height="24" fill="rgba(0,0,0,0.2)"/>
+
+  <!-- Window dots -->
+  <circle cx="258" cy="268" r="10" fill="#FF5F57"/>
+  <circle cx="290" cy="268" r="10" fill="#FEBC2E"/>
+  <circle cx="322" cy="268" r="10" fill="#28C840"/>
+
+  <!-- Terminal prompt > using path instead of text for reliability -->
+  <g transform="translate(280, 380)">
+    <!-- > character as path -->
+    <path d="M0 10 L40 45 L0 80" stroke="#4FC3F7" stroke-width="14" stroke-linecap="round" stroke-linejoin="round" fill="none"/>
+    <!-- _ underscore -->
+    <rect x="60" y="72" width="55" height="10" rx="3" fill="white" opacity="0.95"/>
+  </g>
+
+  <!-- Cursor blink line -->
+  <rect x="420" y="400" width="4" height="60" rx="2" fill="#4FC3F7" opacity="0.85"/>
+
+  <!-- NexifyTerm text -->
+  <text x="512" y="740" font-family="Helvetica Neue, Arial, sans-serif" font-size="72" font-weight="600" fill="#FFFFFF" text-anchor="middle" letter-spacing="3" opacity="0.95">NexifyTerm</text>
+</svg>
