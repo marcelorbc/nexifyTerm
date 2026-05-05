@@ -23,8 +23,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nexia.nexifyterm.widget
         PRODUCT_NAME: NexifyTermWidget
-        MARKETING_VERSION: "0.1.6"
-        CURRENT_PROJECT_VERSION: "6"
+        MARKETING_VERSION: "0.1.7"
+        CURRENT_PROJECT_VERSION: "7"
         SWIFT_VERSION: "5"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
@@ -45,8 +45,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nexia.nexifyterm
         PRODUCT_NAME: NexifyTerm
-        MARKETING_VERSION: "0.1.6"
-        CURRENT_PROJECT_VERSION: "6"
+        MARKETING_VERSION: "0.1.7"
+        CURRENT_PROJECT_VERSION: "7"
         SWIFT_VERSION: "5"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

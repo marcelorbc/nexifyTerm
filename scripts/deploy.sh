@@ -209,13 +209,24 @@ for KEY in "audio-input" "disable-library-validation"; do
 done
 
 # Smoke test: app realmente abre? (detecta crashes de dyld antes do release sair)
+# IMPORTANTE: o `wait`/`kill` retornam exit codes != 0 quando o processo é
+# terminado por sinal (143 = SIGTERM). Como temos `set -e`, qualquer um
+# desses derrubaria o script. Por isso desabilitamos `set -e` localmente.
 "$APP_PATH/Contents/MacOS/${APP_NAME}" >/tmp/${APP_NAME}-smoke.log 2>&1 &
 SMOKE_PID=$!
 sleep 3
+set +e
 if kill -0 $SMOKE_PID 2>/dev/null; then
     kill $SMOKE_PID 2>/dev/null
     wait $SMOKE_PID 2>/dev/null
     pkill -x "$APP_NAME" 2>/dev/null
+    SMOKE_OK=1
+else
+    SMOKE_OK=0
+fi
+set -e
+
+if [ "$SMOKE_OK" = "1" ]; then
     echo "✅ Assinado, entitlements OK, smoke test passou"
 else
     echo "❌ App crashou no smoke test:"
