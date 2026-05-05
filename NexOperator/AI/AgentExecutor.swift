@@ -11,13 +11,39 @@ struct StepResult: Identifiable {
 
 struct ToolInstallRequest {
     let missingTool: MissingToolInfo
-    let continuation: CheckedContinuation<ToolInstallResponse, Never>
+    let resolver: ToolInstallResolver
 }
 
 enum ToolInstallResponse {
     case installTool
     case useAlternative
     case skip
+}
+
+/// Garante que a `CheckedContinuation` seja retomada exatamente UMA vez,
+/// mesmo que cheguem múltiplas resoluções concorrentes (clique do usuário + timeout).
+final class ToolInstallResolver {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<ToolInstallResponse, Never>?
+    /// Callback invocado após o resume bem-sucedido (uma única vez).
+    /// Usado para limpar a UI quando o timeout dispara antes do clique.
+    var onResolved: (@Sendable () -> Void)?
+
+    init(continuation: CheckedContinuation<ToolInstallResponse, Never>) {
+        self.continuation = continuation
+    }
+
+    func resolve(_ response: ToolInstallResponse) {
+        lock.lock()
+        let cont = continuation
+        continuation = nil
+        let cb = onResolved
+        onResolved = nil
+        lock.unlock()
+        guard let cont else { return }
+        cont.resume(returning: response)
+        cb?()
+    }
 }
 
 struct SudoPasswordRequest {
@@ -40,6 +66,9 @@ class AgentExecutor {
 
     var onThinking: (@MainActor (_ phase: String?, _ details: [String]) -> Void)?
     var onStreaming: (@MainActor (_ partialText: String?) -> Void)?
+    /// Callback opcional para mostrar o dry-run preview ao usuário e bloquear
+    /// até a decisão. Quando nil, o dry-run é pulado.
+    var onDryRunRequest: (@MainActor (ExecutionPlan) async -> DryRunDecision)?
 
     init(router: ModelRouter) {
         self.router = router
@@ -49,6 +78,14 @@ class AgentExecutor {
     var contextExtra: String = ""
     var gitViewModel: GitViewModel?
     var fileExplorerDirectory: String?
+    /// Prior turns from the same tab, oldest first. Injected into the prompt so the LLM
+    /// has continuity across user messages (no more "starting from scratch every turn").
+    var priorTurns: [ConversationTurn] = []
+    /// ID único desta rodada de execução (uma por chamada de `execute()`).
+    /// Usado pra correlacionar todos os steps gravados na Execution Timeline.
+    private(set) var currentSessionId: UUID = UUID()
+    /// Prompt original do usuário desta rodada (para gravar com cada step).
+    private var currentUserPrompt: String = ""
 
     func execute(
         userMessage: String,
@@ -101,6 +138,8 @@ class AgentExecutor {
         onToolMissing: @escaping @MainActor (ToolInstallRequest) -> Void,
         onSudoNeeded: @escaping @MainActor (SudoPasswordRequest) -> Void
     ) async throws {
+        currentSessionId = UUID()
+        currentUserPrompt = userMessage
         let logFile = logger.startSession(
             userMessage: userMessage,
             provider: tab.provider.displayName,
@@ -163,8 +202,13 @@ class AgentExecutor {
             mcpToolsContext: mcpToolsCtx,
             fileAttachments: fileAttachments,
             tabMode: tab.tabMode,
-            contextExtra: contextExtra
+            contextExtra: contextExtra,
+            conversationTurns: priorTurns
         )
+
+        if !priorTurns.isEmpty {
+            thinkingCtx.append("💬 \(priorTurns.count) turno(s) de conversa prévia desta aba")
+        }
 
         try Task.checkCancellation()
 
@@ -225,10 +269,12 @@ class AgentExecutor {
         }
 
         // Phase 2: Plan Generation + Execution
+        let hasToolContext = toolCallingContext != nil
+        let capturedThinkingCtx = thinkingCtx
         await MainActor.run {
-            let phase = toolCallingContext != nil ? "Fase 2: Gerando plan" : "Gerando plan"
+            let phase = hasToolContext ? "Fase 2: Gerando plan" : "Gerando plan"
             onStatus("\(phase) via \(tab.provider.displayName)...")
-            onThinking?("Gerando Plan", thinkingCtx + ["⏳ Enviando prompt para a LLM...", "💬 \"\(userMessage.prefix(80))\""])
+            onThinking?("Gerando Plan", capturedThinkingCtx + ["⏳ Enviando prompt para a LLM...", "💬 \"\(userMessage.prefix(80))\""])
         }
 
         var conversationHistory: [StepResult] = []
@@ -292,6 +338,8 @@ class AgentExecutor {
             onThinking?(nil, [])
         }
 
+        applyMemoryUpdatesIfNeeded(plan: initialPlan, onStatus: onStatus)
+
         if initialPlan.hasSkillCreation, let creation = initialPlan.skillCreation {
             let skill = Skill(
                 name: creation.name,
@@ -315,9 +363,33 @@ class AgentExecutor {
             )
         }
 
+        let capturedInitialPlan = initialPlan
         await MainActor.run {
-            onPlanUpdate(initialPlan, 0)
-            onStatus("Plano: \(initialPlan.title)")
+            onPlanUpdate(capturedInitialPlan, 0)
+            onStatus("Plano: \(capturedInitialPlan.title)")
+        }
+
+        // ── Dry-run preview (Phase 1 · Trust) ──────────────────────────────
+        // O plan preview existente já cobre `.alwaysAsk` e `.manualOnly`.
+        // Aqui aplicamos o dry-run RICO (cards visuais com paths e risk) para
+        // os modos de auto-execução quando há ações de risco médio+.
+        if let onDryRunRequest, shouldRequestDryRun(plan: initialPlan, mode: tab.approvalMode) {
+            let dryRunPlan = DryRunPlanner.buildPlan(
+                from: initialPlan,
+                sessionId: currentSessionId,
+                tabId: tab.id.uuidString,
+                userPrompt: userMessage,
+                baseDirectory: fileExplorerDirectory ?? tab.currentDirectory
+            )
+
+            let decision = await onDryRunRequest(dryRunPlan)
+            if decision == .cancel {
+                NexLog.ai.info("Execution cancelled by user via dry-run preview")
+                await MainActor.run {
+                    onComplete("Execução cancelada pelo usuário (dry-run).", nil)
+                }
+                return
+            }
         }
 
         // Execute git actions if present
@@ -328,9 +400,7 @@ class AgentExecutor {
             }
 
             if let vm = gitViewModel {
-                let gitResults = await MainActor.run {
-                    await GitActionExecutor.execute(actions: gitActions, viewModel: vm)
-                }
+                let gitResults = await GitActionExecutor.execute(actions: gitActions, viewModel: vm)
 
                 for gr in gitResults {
                     let stepResult = StepResult(
@@ -358,7 +428,12 @@ class AgentExecutor {
             }
 
             let dir = fileExplorerDirectory ?? tab.currentDirectory
-            let fileResults = await FileActionExecutor.execute(actions: fileActions, directory: dir)
+            let recorder = FileActionRecorder(
+                sessionId: currentSessionId,
+                tabId: tab.id.uuidString,
+                userPrompt: userMessage
+            )
+            let fileResults = await FileActionExecutor.execute(actions: fileActions, directory: dir, recorder: recorder)
 
             for fr in fileResults {
                 let stepResult = StepResult(
@@ -378,10 +453,51 @@ class AgentExecutor {
         }
 
         if initialPlan.hasNoWork {
-            let summary = initialPlan.explanation + "\n\n" + initialPlan.finalNote
-            logger.logCompletion(summary: summary)
-            await MainActor.run { onComplete(summary, initialPlan.richOutput) }
-            return
+            // Defense against the "promise mode" / "fake completion" anti-patterns.
+            // We retry up to twice (3 LLM calls total) before giving up — some
+            // models will repeat the same promise on the first nudge but yield
+            // on the second.
+            let maxPromiseRetries = 2
+            var attempt = 0
+            while attempt < maxPromiseRetries, Self.shouldForceExecution(initialPlan) {
+                attempt += 1
+                let kind = Self.isPromiseExplanation(initialPlan.explanation + " " + initialPlan.finalNote)
+                    ? "promessa futura"
+                    : "fake completion (passado sem execução)"
+                NexLog.ai.warning("Plan flagged as \(kind) — forcing executable follow-up (attempt \(attempt)/\(maxPromiseRetries))")
+                await MainActor.run {
+                    onStatus("Modelo \(kind) — pedindo plano real (\(attempt)/\(maxPromiseRetries))...")
+                    onThinking?("Anti-promessa ativada", [
+                        "⚠️ Detecção: \(kind)",
+                        "➡️ Tentativa \(attempt)/\(maxPromiseRetries) — exigindo comandos ou resultado completo."
+                    ])
+                }
+                do {
+                    initialPlan = try await regenerateAfterPromise(
+                        originalRequest: userMessage,
+                        promiseText: initialPlan.explanation + "\n" + initialPlan.finalNote,
+                        session: session,
+                        tab: tab,
+                        onChunk: streamingCb
+                    )
+                    await MainActor.run {
+                        onStreaming?(nil)
+                        onThinking?(nil, [])
+                        onPlanUpdate(initialPlan, 0)
+                    }
+                } catch {
+                    NexLog.ai.warning("Promise recovery failed (attempt \(attempt)): \(error.localizedDescription)")
+                    break
+                }
+            }
+
+            if initialPlan.hasNoWork {
+                let summary = initialPlan.explanation + "\n\n" + initialPlan.finalNote
+                logger.logCompletion(summary: summary)
+                let richOut = initialPlan.richOutput
+                await MainActor.run { onComplete(summary, richOut) }
+                return
+            }
         }
 
         var currentPlan = initialPlan
@@ -423,18 +539,21 @@ class AgentExecutor {
             if conversationHistory.count >= maxSteps {
                 let msg = "Limite de \(maxSteps) passos atingido."
                 logger.logCompletion(summary: msg)
-                await MainActor.run { onComplete(msg, lastRichOutput) }
+                let capturedRich = lastRichOutput
+                await MainActor.run { onComplete(msg, capturedRich) }
                 return
             }
 
             try Task.checkCancellation()
+            let capturedRound = round
+            let capturedHistory = conversationHistory
             await MainActor.run {
-                onStatus("Analisando resultados (round \(round))...")
-                let stepSummary = conversationHistory.suffix(3).map { r in
+                onStatus("Analisando resultados (round \(capturedRound))...")
+                let stepSummary = capturedHistory.suffix(3).map { r in
                     let icon = r.output.succeeded ? "✅" : "❌"
                     return "\(icon) \(r.command.prefix(50))"
                 }
-                onThinking?("Analisando round \(round)", stepSummary + ["⏳ Enviando resultados para a LLM..."])
+                onThinking?("Analisando round \(capturedRound)", stepSummary + ["⏳ Enviando resultados para a LLM..."])
             }
 
             var followUpPlan: AgentPlan
@@ -451,7 +570,8 @@ class AgentExecutor {
                 NexLog.ai.error("Follow-up failed: \(error.localizedDescription)")
                 let summary = currentPlan.finalNote.isEmpty ? "Execução parcial concluída." : currentPlan.finalNote
                 logger.logCompletion(summary: summary)
-                await MainActor.run { onComplete(summary, lastRichOutput) }
+                let capturedRichErr = lastRichOutput
+                await MainActor.run { onComplete(summary, capturedRichErr) }
                 return
             }
 
@@ -461,6 +581,8 @@ class AgentExecutor {
             }
 
             logger.logFollowUp(followUpPlan)
+
+            applyMemoryUpdatesIfNeeded(plan: followUpPlan, onStatus: onStatus)
 
             if followUpPlan.hasMCPToolCalls {
                 followUpPlan = try await handleMCPToolCalls(
@@ -477,9 +599,7 @@ class AgentExecutor {
 
             // Execute follow-up git actions
             if followUpPlan.hasGitActions, let gitActs = followUpPlan.gitActions, let vm = gitViewModel {
-                let gitResults = await MainActor.run {
-                    await GitActionExecutor.execute(actions: gitActs, viewModel: vm)
-                }
+                let gitResults = await GitActionExecutor.execute(actions: gitActs, viewModel: vm)
                 for gr in gitResults {
                     let stepResult = StepResult(
                         command: "git:\(gr.action.type)",
@@ -494,7 +614,12 @@ class AgentExecutor {
             // Execute follow-up file actions
             if followUpPlan.hasFileActions, let fileActs = followUpPlan.fileActions {
                 let dir = fileExplorerDirectory ?? tab.currentDirectory
-                let fileResults = await FileActionExecutor.execute(actions: fileActs, directory: dir)
+                let recorder = FileActionRecorder(
+                    sessionId: currentSessionId,
+                    tabId: tab.id.uuidString,
+                    userPrompt: userMessage
+                )
+                let fileResults = await FileActionExecutor.execute(actions: fileActs, directory: dir, recorder: recorder)
                 for fr in fileResults {
                     let stepResult = StepResult(
                         command: "file:\(fr.action.type)",
@@ -509,19 +634,218 @@ class AgentExecutor {
             if followUpPlan.hasNoWork {
                 let summary = followUpPlan.explanation + "\n\n" + followUpPlan.finalNote
                 logger.logCompletion(summary: summary)
-                await MainActor.run { onComplete(summary, followUpPlan.richOutput ?? lastRichOutput) }
+                let capturedRichDone = followUpPlan.richOutput ?? lastRichOutput
+                await MainActor.run { onComplete(summary, capturedRichDone) }
                 return
             }
 
             currentPlan = followUpPlan
+            let capturedFollowUp = followUpPlan
+            let capturedRoundUp = round
             await MainActor.run {
-                onPlanUpdate(followUpPlan, round)
+                onPlanUpdate(capturedFollowUp, capturedRoundUp)
             }
         }
 
         let msg = "Execução concluída após \(round) rounds e \(conversationHistory.count) passos."
         logger.logCompletion(summary: msg)
-        await MainActor.run { onComplete(msg, lastRichOutput) }
+        let capturedRichFinal = lastRichOutput
+        await MainActor.run { onComplete(msg, capturedRichFinal) }
+    }
+
+    // MARK: - Promise & fake-completion detection
+
+    /// Future-tense / wait-for-me promises. The presence of any one of these
+    /// in `explanation`+`finalNote` (when no commands ran) flags the response
+    /// as a promise instead of an execution.
+    private static let promisePatterns: [String] = [
+        // verb "vou X" - core list
+        "vou fazer", "vou extrair", "vou analisar", "vou listar",
+        "vou processar", "vou gerar", "vou montar", "vou criar",
+        "vou rodar", "vou executar", "vou checar", "vou verificar",
+        "vou consultar", "vou abrir", "vou ler",
+        "vou te entregar", "vou te mostrar", "vou te enviar",
+        "vou retornar", "vou trazer", "vou continuar",
+        // verbs that previously slipped through (turnos 1, 4 e 5 do bug report)
+        "vou inspecionar", "vou agrupar", "vou identificar",
+        "vou separar", "vou organizar", "vou mapear",
+        "vou classificar", "vou categorizar", "vou aprofundar",
+        "vou mostrar", "vou exibir", "vou apresentar",
+        "vou detalhar", "vou explorar", "vou consolidar",
+        "vou compilar", "vou cruzar", "vou comparar",
+        "vou levantar", "vou puxar", "vou buscar",
+        "vou coletar", "vou enumerar", "vou descrever",
+        // generic future markers
+        "farei", "em seguida", "assim que terminar",
+        "assim que a extração terminar", "aguarde enquanto",
+        "em breve", "em instantes", "quando terminar",
+        // fake follow-ups: "Se quiser, posso..." / "no próximo passo eu..."
+        "se quiser, posso", "se você quiser, posso",
+        "se quiser eu posso", "se quiser eu aprofundo",
+        "no próximo passo eu", "no próximo passo, eu",
+        "no próximo passo posso", "no próximo passo, posso",
+        "quer que eu", "deseja que eu",
+        "posso aprofundar", "posso abrir", "posso detalhar",
+        "posso resumir", "posso listar", "posso mostrar",
+    ]
+
+    /// Past-tense verbs the LLM uses to fake completion.
+    private static let fakeCompletionVerbs: [String] = [
+        "organizei", "agrupei", "listei", "identifiquei",
+        "mapeei", "classifiquei", "categorizei", "consolidei",
+        "elenquei", "separei", "analisei", "inspecionei",
+        "verifiquei", "compilei", "extraí",
+    ]
+
+    /// Markers that betray the response is *inferred from names* rather than
+    /// from real data. When the LLM uses these alongside a past-tense verb
+    /// without any command output, it's almost always a fake completion.
+    private static let inferenceMarkers: [String] = [
+        "inferida", "inferência",
+        "com base nos nomes", "pelo nome das pastas",
+        "pelo nome dos diretórios", "pelo contexto dos nomes",
+        "ainda não abrimos", "ainda não inspecionamos",
+        "ainda não rodamos", "ainda não executamos",
+        "como ainda não",
+    ]
+
+    /// Heuristic: returns true when the plan's explanation/finalNote sounds
+    /// like a future-tense promise. Used together with `hasNoWork` to force
+    /// a retry.
+    static func isPromiseExplanation(_ text: String) -> Bool {
+        let lowered = text.lowercased()
+        let trimmed = lowered.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 20, trimmed.count < 4000 else { return false }
+        for pattern in promisePatterns where lowered.contains(pattern) {
+            return true
+        }
+        return false
+    }
+
+    /// Heuristic: detects the **fake completion** anti-pattern — the LLM
+    /// pretends it already did the work ("Organizei...", "Identifiquei...")
+    /// while admitting it inferred from names only and producing no
+    /// commands and no `richOutput`. This was Turno 3 of the bug report.
+    static func isFakeCompletion(_ plan: AgentPlan) -> Bool {
+        // Real work shipped? Not fake.
+        guard plan.hasNoWork else { return false }
+        if hasMaterialRichOutput(plan.richOutput) { return false }
+
+        let text = (plan.explanation + " " + plan.finalNote).lowercased()
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > 20 else { return false }
+
+        let claimsPast = fakeCompletionVerbs.contains { text.contains($0) }
+        let admitsInference = inferenceMarkers.contains { text.contains($0) }
+
+        // Strong signal: claims completion in past tense AND admits it's only inferred.
+        return claimsPast && admitsInference
+    }
+
+    /// Combined check — drives the retry loop in the executor.
+    static func shouldForceExecution(_ plan: AgentPlan) -> Bool {
+        if !plan.hasNoWork { return false }
+        if isPromiseExplanation(plan.explanation + " " + plan.finalNote) { return true }
+        if isFakeCompletion(plan) { return true }
+        return false
+    }
+
+    /// A `RichOutput` only counts as "real evidence" if it actually carries
+    /// data — empty metrics/empty rows shouldn't excuse a fake completion.
+    private static func hasMaterialRichOutput(_ rich: RichOutput?) -> Bool {
+        guard let rich else { return false }
+        if let metrics = rich.metrics, !metrics.isEmpty { return true }
+        if let table = rich.table, !table.rows.isEmpty { return true }
+        if let chart = rich.chart, !chart.items.isEmpty { return true }
+        if let html = rich.html, !html.isEmpty { return true }
+        if let url = rich.openUrl, !url.isEmpty { return true }
+        return false
+    }
+
+    private func regenerateAfterPromise(
+        originalRequest: String,
+        promiseText: String,
+        session: TerminalSession,
+        tab: TerminalTab,
+        onChunk: @escaping StreamCallback
+    ) async throws -> AgentPlan {
+        try Task.checkCancellation()
+
+        let nudge = """
+        Sua resposta anterior foi REJEITADA pelo guarda anti-promessa. Você escreveu:
+        ---
+        \(promiseText.prefix(800))
+        ---
+
+        Por que foi rejeitada (escolha o caso que se aplica):
+        1) **Promessa futura**: você usou "vou X", "farei", "em seguida", "se quiser, posso", \
+           "no próximo passo", "posso aprofundar", etc. — sem nenhum comando em `commands`.
+        2) **Fake completion**: você escreveu no PASSADO ("organizei", "agrupei", \
+           "identifiquei", "mapeei", "consolidei") afirmando que fez algo, mas admitiu \
+           que era "inferido pelo nome", "com base nos nomes", "ainda não abrimos", \
+           "ainda não inspecionamos", e não rodou comando algum. Isso é mentira: você \
+           NÃO fez o trabalho. PROIBIDO.
+
+        Você AGORA tem exatamente DUAS opções, escolha UMA:
+
+        OPÇÃO A — EXECUTE: retorne `commands` (ou `gitActions`/`fileActions`) com os \
+        comandos reais para resolver: "\(originalRequest)". Sem futuro, sem promessas, \
+        sem fake follow-ups. Apenas o comando.
+
+        OPÇÃO B — RESULTADO COMPLETO AGORA: se você já tem dados reais (vindos de \
+        comandos anteriores neste chat ou do contexto), retorne `commands` vazio E \
+        coloque o RESULTADO COMPLETO em `explanation` (texto final) e/ou `richOutput` \
+        (tabela/métricas/gráfico com os dados reais — NÃO inferidos por nome).
+
+        REGRAS IMPÓSTAS:
+        - NÃO repita "vou fazer", "vou inspecionar", "vou agrupar", "vou identificar", \
+          "se quiser, posso", "no próximo passo".
+        - NÃO use passado fingindo conclusão sem dados ("organizei", "agrupei", "identifiquei") \
+          se não rodou comando E não tem dados reais no histórico.
+        - Se a tarefa exige listar arquivos, agrupar projetos por tecnologia, identificar \
+          stack — você PRECISA rodar `find`, `ls`, `cat package.json`, `head Cargo.toml`, \
+          `find . -name "*.gemspec"`, `stat`, etc. para ter dados reais.
+
+        Pedido original do usuário: "\(originalRequest)"
+        """
+
+        let terminalText = await MainActor.run { session.getTerminalText(maxLines: 30) }
+
+        let input = AgentInput(
+            userMessage: nudge,
+            currentDirectory: tab.currentDirectory,
+            provider: tab.provider,
+            model: tab.model,
+            terminalContext: terminalText,
+            tabMode: tab.tabMode,
+            contextExtra: contextExtra,
+            conversationTurns: priorTurns
+        )
+
+        return try await router.generatePlanStreaming(input: input, onChunk: onChunk)
+    }
+
+    // MARK: - Memory auto-capture
+
+    /// If the plan came back with `memoryUpdates` and the user has auto-capture
+    /// enabled, persist them to `MemoryStore`. Notifies the UI via `onStatus`.
+    private func applyMemoryUpdatesIfNeeded(
+        plan: AgentPlan,
+        onStatus: @escaping @MainActor (String) -> Void
+    ) {
+        guard plan.hasMemoryUpdates,
+              let updates = plan.memoryUpdates,
+              ConfigStore.shared.memoryAutoCapture,
+              ConfigStore.shared.memoryEnabled
+        else { return }
+
+        let changes = MemoryStore.shared.applyUpdates(updates)
+        guard changes > 0 else { return }
+
+        NexLog.ai.info("Memory auto-capture: \(changes) update(s) applied")
+        Task { @MainActor in
+            onStatus("🧠 \(changes) memória(s) atualizada(s)")
+        }
     }
 
     // MARK: - Tool Calling Helpers
@@ -563,7 +887,10 @@ class AgentExecutor {
             model: input.model,
             terminalContext: input.terminalContext,
             mcpToolsContext: input.mcpToolsContext,
-            fileAttachments: input.fileAttachments
+            fileAttachments: input.fileAttachments,
+            tabMode: input.tabMode,
+            contextExtra: input.contextExtra,
+            conversationTurns: input.conversationTurns
         )
         return try await router.generatePlanStreaming(input: enrichedInput, onChunk: onChunk)
     }
@@ -626,7 +953,11 @@ class AgentExecutor {
             )
         }
 
-        session.sendCommand(command.command)
+        // Visual echo only — the actual execution happens via CommandExecutor below.
+        // Sending to the PTY too would execute the command twice (one in the visible
+        // shell, one in the parallel Process), duplicating side effects (mkdir, npm
+        // install, etc.).
+        session.echoAgentCommand(command.command)
 
         let savedPassword = SudoManager.shared.savedPassword
         var output = await CommandExecutor.run(
@@ -634,6 +965,7 @@ class AgentExecutor {
             workingDirectory: tab.currentDirectory,
             sudoPassword: CommandExecutor.needsSudo(command.command) ? savedPassword : nil
         )
+        session.echoAgentOutput(output.truncatedOutput, exitCode: output.exitCode)
 
         guard !Task.isCancelled else {
             return StepResult(
@@ -705,8 +1037,45 @@ class AgentExecutor {
             risk: guardResult.classifiedRisk,
             wasBlocked: false
         )
+
+        let timelineStep = ExecutionStep(
+            sessionId: currentSessionId,
+            tabId: tab.id.uuidString,
+            kind: .shellCommand,
+            title: command.command,
+            detail: command.reason,
+            risk: guardResult.classifiedRisk,
+            dryRun: false,
+            status: output.exitCode == 0 ? .completed : .failed,
+            output: output.truncatedOutput,
+            errorMessage: output.exitCode == 0 ? nil : output.stderr,
+            userPrompt: currentUserPrompt
+        )
+        ExecutionLogStore.shared.upsert(timelineStep)
+
         await MainActor.run { onStep(result) }
         return result
+    }
+
+    /// Decide se devemos mostrar o dry-run preview rico para este plano.
+    /// Retorna `false` para modos onde o PlanPreview existente já cuida disso.
+    private func shouldRequestDryRun(plan: AgentPlan, mode: ApprovalMode) -> Bool {
+        // Se NÃO tem nada que altere estado, não tem o que prever.
+        guard plan.hasFileActions || plan.hasGitActions || !plan.commands.isEmpty else {
+            return false
+        }
+        switch mode {
+        case .alwaysAsk, .manualOnly:
+            // Já tem PlanPreview existente — evita dupla aprovação.
+            return false
+        case .autoAll:
+            // No auto, mostramos só quando há risco médio+ (proteção mínima).
+            return plan.maxRiskLevel >= .medium || plan.hasFileActions
+        case .riskBased:
+            return plan.maxRiskLevel >= .medium || plan.hasFileActions
+        case .autoReadOnly:
+            return plan.maxRiskLevel > .readOnly
+        }
     }
 
     static func parseRichOutput(from content: String) -> (cleanContent: String, richOutput: RichOutput?) {
@@ -780,17 +1149,38 @@ class AgentExecutor {
         onStatus: @escaping @MainActor (String) -> Void,
         onToolMissing: @escaping @MainActor (ToolInstallRequest) -> Void
     ) async -> CommandOutput {
-        await MainActor.run {
-            onStatus("Ferramenta '\(missingTool.toolName)' não encontrada — aguardando decisão...")
+        // Auto-aplicar alternativa quando seguro (builtin do bash ou path absoluto do sistema).
+        // Evita travar a UI esperando clique para casos óbvios como `shopt` em zsh.
+        if missingTool.canAutoApply,
+           let alt = missingTool.installSuggestion?.alternativeCommand {
+            await MainActor.run {
+                onStatus("Aplicando alternativa automaticamente: \(alt)")
+            }
+            session.echoAgentCommand(alt)
+            let altOut = await CommandExecutor.run(alt, workingDirectory: tab.currentDirectory)
+            session.echoAgentOutput(altOut.truncatedOutput, exitCode: altOut.exitCode)
+            return altOut
         }
 
-        let response = await withCheckedContinuation { (continuation: CheckedContinuation<ToolInstallResponse, Never>) in
+        await MainActor.run {
+            onStatus("Ferramenta '\(missingTool.toolName)' não encontrada — aguardando decisão (timeout 30s)...")
+        }
+
+        // Timeout de 30s: se o usuário não responder, faz skip automático.
+        // Implementação segura: 1 única continuation, resolvida por quem chegar primeiro
+        // (resposta do usuário OU timer). Guarda atômica garante resume único.
+        let response: ToolInstallResponse = await withCheckedContinuation { (continuation: CheckedContinuation<ToolInstallResponse, Never>) in
+            let resolver = ToolInstallResolver(continuation: continuation)
             let request = ToolInstallRequest(
                 missingTool: missingTool,
-                continuation: continuation
+                resolver: resolver
             )
             Task { @MainActor in
                 onToolMissing(request)
+            }
+            Task {
+                try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+                resolver.resolve(.skip)
             }
         }
 
@@ -806,8 +1196,10 @@ class AgentExecutor {
             }
             let fixedCommand = originalCommand.replacingOccurrences(of: missingTool.toolName, with: alt)
             await MainActor.run { onStatus("Tentando com path completo: \(fixedCommand)") }
-            session.sendCommand(fixedCommand)
-            return await CommandExecutor.run(fixedCommand, workingDirectory: tab.currentDirectory)
+            session.echoAgentCommand(fixedCommand)
+            let altOut = await CommandExecutor.run(fixedCommand, workingDirectory: tab.currentDirectory)
+            session.echoAgentOutput(altOut.truncatedOutput, exitCode: altOut.exitCode)
+            return altOut
 
         case .installTool:
             guard let suggestion = missingTool.installSuggestion,
@@ -815,8 +1207,10 @@ class AgentExecutor {
                 if let alt = missingTool.installSuggestion?.alternativeCommand {
                     let fixedCommand = originalCommand.replacingOccurrences(of: missingTool.toolName, with: alt)
                     await MainActor.run { onStatus("Usando path do sistema: \(fixedCommand)") }
-                    session.sendCommand(fixedCommand)
-                    return await CommandExecutor.run(fixedCommand, workingDirectory: tab.currentDirectory)
+                    session.echoAgentCommand(fixedCommand)
+                    let altOut = await CommandExecutor.run(fixedCommand, workingDirectory: tab.currentDirectory)
+                    session.echoAgentOutput(altOut.truncatedOutput, exitCode: altOut.exitCode)
+                    return altOut
                 }
                 return CommandOutput(
                     command: originalCommand, stdout: "", stderr: "Sem sugestão de instalação para \(missingTool.toolName)", exitCode: -1
@@ -824,8 +1218,9 @@ class AgentExecutor {
             }
 
             await MainActor.run { onStatus("Instalando \(missingTool.toolName)...") }
-            session.sendCommand(suggestion.installCommand)
+            session.echoAgentCommand(suggestion.installCommand)
             let installOutput = await CommandExecutor.run(suggestion.installCommand, workingDirectory: tab.currentDirectory)
+            session.echoAgentOutput(installOutput.truncatedOutput, exitCode: installOutput.exitCode)
 
             guard installOutput.succeeded else {
                 return CommandOutput(
@@ -837,8 +1232,10 @@ class AgentExecutor {
             }
 
             await MainActor.run { onStatus("Retentando: \(originalCommand)") }
-            session.sendCommand(originalCommand)
-            return await CommandExecutor.run(originalCommand, workingDirectory: tab.currentDirectory)
+            session.echoAgentCommand(originalCommand)
+            let retryOut = await CommandExecutor.run(originalCommand, workingDirectory: tab.currentDirectory)
+            session.echoAgentOutput(retryOut.truncatedOutput, exitCode: retryOut.exitCode)
+            return retryOut
 
         case .skip:
             return CommandOutput(
@@ -899,7 +1296,8 @@ class AgentExecutor {
             model: tab.model,
             terminalContext: terminalText,
             tabMode: tab.tabMode,
-            contextExtra: contextExtra
+            contextExtra: contextExtra,
+            conversationTurns: priorTurns
         )
 
         try Task.checkCancellation()
@@ -929,7 +1327,8 @@ class AgentExecutor {
             model: tab.model,
             terminalContext: terminalText,
             tabMode: tab.tabMode,
-            contextExtra: contextExtra
+            contextExtra: contextExtra,
+            conversationTurns: priorTurns
         )
 
         try Task.checkCancellation()

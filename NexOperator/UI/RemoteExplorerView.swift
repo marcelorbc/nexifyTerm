@@ -1,9 +1,18 @@
 import SwiftUI
 
 struct RemoteExplorerView: View {
-    @StateObject private var viewModel = RemoteExplorerViewModel()
+    @StateObject private var viewModel: RemoteExplorerViewModel
+    @ObservedObject private var techDetector = RepoTechDetector.shared
     @Environment(\.dismiss) private var dismiss
     @State private var sidebarWidth: CGFloat = 220
+
+    init(defaultClonePath: String? = nil) {
+        _viewModel = StateObject(wrappedValue: {
+            let vm = RemoteExplorerViewModel()
+            vm.defaultClonePath = defaultClonePath
+            return vm
+        }())
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -34,10 +43,13 @@ struct RemoteExplorerView: View {
         }
         .overlay(alignment: .bottom) {
             if let toast = viewModel.toastMessage {
-                GitToastView(message: toast, isError: viewModel.toastIsError)
+                GitToastView(
+                    message: toast,
+                    isError: viewModel.toastIsError,
+                    onDismiss: viewModel.toastIsError ? { viewModel.dismissToast() } : nil
+                )
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .padding(.bottom, 16)
-                    .onTapGesture { viewModel.toastMessage = nil }
             }
         }
         .animation(.easeInOut(duration: 0.25), value: viewModel.toastMessage)
@@ -190,33 +202,41 @@ struct RemoteExplorerView: View {
     }
 
     private var repoToolbar: some View {
-        HStack(spacing: 8) {
-            HStack(spacing: 4) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: NexTheme.iconSizeSmall))
-                    .foregroundColor(NexTheme.textSecondary)
-                TextField("Buscar repositórios...", text: $viewModel.searchQuery)
-                    .textFieldStyle(.plain)
-                    .font(.system(size: 12))
-                    .onSubmit {
-                        Task { await viewModel.searchRepositories() }
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                HStack(spacing: 4) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: NexTheme.iconSizeSmall))
+                        .foregroundColor(NexTheme.textSecondary)
+                    TextField("Buscar por nome, descrição, tech…", text: $viewModel.searchQuery)
+                        .textFieldStyle(.plain)
+                        .font(.system(size: 12))
+                        .onSubmit {
+                            Task { await viewModel.searchRepositories() }
+                        }
+                    if !viewModel.searchQuery.isEmpty {
+                        Button { viewModel.searchQuery = "" } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.system(size: 10))
+                                .foregroundColor(NexTheme.textSecondary)
+                        }
+                        .buttonStyle(.plain)
                     }
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 5)
-            .background(NexTheme.surface)
-            .cornerRadius(6)
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(NexTheme.border, lineWidth: 0.5)
-            )
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 5)
+                .background(NexTheme.surface)
+                .cornerRadius(6)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6)
+                        .stroke(NexTheme.border, lineWidth: 0.5)
+                )
 
-            Spacer()
+                sortMenu
 
-            if !viewModel.filteredRepositories.isEmpty {
-                Text("\(viewModel.filteredRepositories.count) repos")
-                    .font(.system(size: 10))
-                    .foregroundColor(NexTheme.textSecondary)
+                Spacer()
+
+                counterArea
 
                 Button {
                     if viewModel.selectedForClone.count == viewModel.filteredRepositories.count {
@@ -230,21 +250,129 @@ struct RemoteExplorerView: View {
                         .foregroundColor(NexTheme.accent)
                 }
                 .buttonStyle(.plain)
-            }
+                .disabled(viewModel.filteredRepositories.isEmpty)
 
-            Button {
-                Task { await viewModel.loadRepositories() }
-            } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: NexTheme.iconSizeSmall))
-                    .foregroundColor(NexTheme.textSecondary)
+                Button {
+                    Task { await viewModel.loadRepositories() }
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                        .font(.system(size: NexTheme.iconSizeSmall))
+                        .foregroundColor(NexTheme.textSecondary)
+                }
+                .buttonStyle(.plain)
+                .help("Recarregar tudo")
             }
-            .buttonStyle(.plain)
-            .help("Recarregar")
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+
+            techChipsRow
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
         .background(NexTheme.surface.opacity(0.5))
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            ForEach(RemoteExplorerViewModel.RepoSortOption.allCases) { opt in
+                Button {
+                    viewModel.sortOption = opt
+                    viewModel.applyFilters()
+                } label: {
+                    HStack {
+                        Text(opt.rawValue)
+                        if viewModel.sortOption == opt {
+                            Image(systemName: "checkmark")
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 3) {
+                Image(systemName: "arrow.up.arrow.down")
+                    .font(.system(size: 10))
+                Text(viewModel.sortOption.rawValue)
+                    .font(.system(size: 11))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .bold))
+            }
+            .foregroundColor(NexTheme.textSecondary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 5)
+            .background(NexTheme.surface)
+            .cornerRadius(6)
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(NexTheme.border, lineWidth: 0.5))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+    }
+
+    private var counterArea: some View {
+        HStack(spacing: 6) {
+            if viewModel.filteredRepositories.count == viewModel.repositories.count {
+                Text("\(viewModel.repositories.count) repos")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(NexTheme.textSecondary)
+            } else {
+                Text("\(viewModel.filteredRepositories.count) de \(viewModel.repositories.count)")
+                    .font(.system(size: 11, weight: .medium))
+                    .foregroundColor(NexTheme.accent)
+            }
+            if viewModel.isDetectingTechs {
+                HStack(spacing: 3) {
+                    ProgressView().controlSize(.mini)
+                    Text("Detectando tech…")
+                        .font(.system(size: 9))
+                        .foregroundColor(NexTheme.textSecondary)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var techChipsRow: some View {
+        let availableTechs = viewModel.availableTechs
+        let hasFilter = !viewModel.selectedTechFilters.isEmpty
+        if !availableTechs.isEmpty || hasFilter {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 5) {
+                    techChip(label: "Todas", isSelected: !hasFilter, color: NexTheme.accent) {
+                        viewModel.clearTechFilters()
+                    }
+                    Divider().frame(height: 18)
+                    ForEach(availableTechs) { tech in
+                        techChip(
+                            label: tech.label,
+                            isSelected: viewModel.selectedTechFilters.contains(tech),
+                            color: tech.color
+                        ) {
+                            viewModel.toggleTechFilter(tech)
+                        }
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.bottom, 8)
+            }
+        }
+    }
+
+    private func techChip(label: String, isSelected: Bool, color: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Circle().fill(color).frame(width: 7, height: 7)
+                Text(label)
+                    .font(.system(size: 10, weight: isSelected ? .semibold : .regular))
+            }
+            .foregroundColor(isSelected ? .white : NexTheme.textPrimary)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(isSelected ? color : NexTheme.surface)
+            .cornerRadius(10)
+            .overlay(
+                RoundedRectangle(cornerRadius: 10)
+                    .stroke(isSelected ? color : NexTheme.border, lineWidth: 0.5)
+            )
+        }
+        .buttonStyle(.plain)
     }
 
     private var repoScrollView: some View {
@@ -261,9 +389,16 @@ struct RemoteExplorerView: View {
                             viewModel.prepareClone()
                         }
                     )
+                    .environmentObject(techDetector)
                 }
             }
             .padding(8)
+        }
+        // Re-aplica filtro quando o detector terminar de classificar repos
+        // — assim os chips de tech aparecem na barra e a busca passa a
+        // matchear "react"/"python"/etc.
+        .onReceive(techDetector.$techsByRepo) { _ in
+            viewModel.applyFilters()
         }
     }
 
@@ -511,11 +646,29 @@ struct RemoteRepoRow: View {
     let onOpen: () -> Void
     let onClone: () -> Void
 
+    @EnvironmentObject var techDetector: RepoTechDetector
+
     private let dateFormatter: RelativeDateTimeFormatter = {
         let f = RelativeDateTimeFormatter()
         f.locale = Locale(identifier: "pt-BR")
         return f
     }()
+
+    /// Up to 3 most relevant techs (frameworks first, then languages).
+    private var displayTechs: [RepoTech] {
+        let detected = techDetector.techs(for: repo) ?? []
+        guard !detected.isEmpty else { return [] }
+        // Priorize frameworks/UI sobre runtime — assim "Next.js" aparece
+        // antes de "TypeScript" ou "Node.js".
+        let priority: [RepoTech.Category] = [.frontend, .mobile, .backend, .infra, .other]
+        let sorted = detected.sorted { lhs, rhs in
+            let lp = priority.firstIndex(of: lhs.category) ?? 99
+            let rp = priority.firstIndex(of: rhs.category) ?? 99
+            if lp != rp { return lp < rp }
+            return lhs.label < rhs.label
+        }
+        return Array(sorted.prefix(3))
+    }
 
     var body: some View {
         HStack(spacing: 10) {
@@ -533,6 +686,7 @@ struct RemoteRepoRow: View {
                     Text(repo.name)
                         .font(.system(size: 12, weight: .semibold))
                         .foregroundColor(NexTheme.textPrimary)
+                        .lineLimit(1)
 
                     if repo.isPrivate {
                         Text("privado")
@@ -542,6 +696,26 @@ struct RemoteRepoRow: View {
                             .padding(.vertical, 1)
                             .background(Color.orange.opacity(0.1))
                             .cornerRadius(3)
+                    }
+
+                    // Tech badges — filled chips com cor da linguagem.
+                    ForEach(displayTechs) { tech in
+                        HStack(spacing: 3) {
+                            Circle().fill(tech.color).frame(width: 5, height: 5)
+                            Text(tech.label)
+                                .font(.system(size: 9, weight: .medium))
+                        }
+                        .foregroundColor(tech.color)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(tech.color.opacity(0.12))
+                        .cornerRadius(3)
+                        .overlay(RoundedRectangle(cornerRadius: 3).stroke(tech.color.opacity(0.35), lineWidth: 0.5))
+                    }
+
+                    // Pequeno spinner enquanto a detecção roda
+                    if techDetector.isDetecting(repo) {
+                        ProgressView().controlSize(.mini)
                     }
                 }
 
@@ -931,9 +1105,28 @@ struct AddAccountSheet: View {
                     .font(.system(size: 10, weight: .medium))
                     .foregroundColor(NexTheme.textSecondary)
 
-                SecureField("Colar Personal Access Token", text: $viewModel.newAccountToken)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12))
+                HStack(spacing: 6) {
+                    SecureField("Colar Personal Access Token", text: $viewModel.newAccountToken)
+                        .textFieldStyle(.roundedBorder)
+                        .font(.system(size: 12))
+
+                    Button {
+                        openPATCreationPage()
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "arrow.up.right.square")
+                                .font(.system(size: 11))
+                            Text("Criar token")
+                                .font(.system(size: 10, weight: .medium))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 5)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(NexTheme.accent))
+                    }
+                    .buttonStyle(.plain)
+                    .help("Abrir página de criação de token no navegador")
+                }
             }
 
             HStack {
@@ -971,9 +1164,28 @@ struct AddAccountSheet: View {
                     .font(.system(size: 12))
             }
 
-            SecureField("Personal Access Token", text: $viewModel.newAccountToken)
-                .textFieldStyle(.roundedBorder)
-                .font(.system(size: 12))
+            HStack(spacing: 6) {
+                SecureField("Personal Access Token", text: $viewModel.newAccountToken)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12))
+
+                Button {
+                    openPATCreationPage()
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.up.right.square")
+                            .font(.system(size: 11))
+                        Text("Criar token")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 5)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(NexTheme.accent))
+                }
+                .buttonStyle(.plain)
+                .help("Abrir página de criação de token no navegador")
+            }
 
             tokenHelp
 
@@ -1050,6 +1262,20 @@ struct AddAccountSheet: View {
         .padding(8)
         .background(NexTheme.surface)
         .cornerRadius(6)
+    }
+
+    private func openPATCreationPage() {
+        let urlString: String
+        switch viewModel.newAccountProvider {
+        case .github:
+            urlString = "https://github.com/settings/tokens/new?scopes=repo,read:org,read:user&description=NexifyTerm"
+        case .azureDevOps:
+            let org = viewModel.newAccountOrg.isEmpty ? "_" : viewModel.newAccountOrg
+            urlString = "https://dev.azure.com/\(org)/_usersSettings/tokens"
+        }
+        if let url = URL(string: urlString) {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: - Detected Hint Banner

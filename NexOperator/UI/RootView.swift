@@ -12,6 +12,9 @@ struct RootView: View {
     @State private var showWelcome = true
     @State private var terminalRatio: CGFloat = 0.6
     @State private var keyMonitor: Any?
+    @State private var showExecutionTimeline = false
+    @State private var showCockpit = false
+    @ObservedObject private var providerAvailability = ProviderAvailabilityService.shared
 
     private var hasResults: Bool {
         appState.isAgentRunning || !appState.agentResults.isEmpty || appState.agentStatus != nil
@@ -68,7 +71,18 @@ struct RootView: View {
                                 TerminalContainerView()
                             }
 
-                            if showWelcome && appState.activeTab?.isTerminal == true && !appState.isAgentRunning && appState.agentResults.isEmpty && !appState.isShowingPlanPreview && appState.browserURL == nil {
+                            if providerAvailability.hasChecked && !providerAvailability.hasAnyProvider {
+                                Color.black.opacity(0.25)
+                                    .ignoresSafeArea()
+                                NoProviderBannerView {
+                                    if #available(macOS 14.0, *) {
+                                        NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+                                    } else {
+                                        NSApp.sendAction(Selector(("showPreferencesWindow:")), to: nil, from: nil)
+                                    }
+                                }
+                                .transition(.opacity.combined(with: .scale(scale: 0.96)))
+                            } else if showWelcome && appState.activeTab?.isTerminal == true && !appState.isAgentRunning && appState.agentResults.isEmpty && !appState.isShowingPlanPreview && appState.browserURL == nil {
                                 WelcomeOverlay { prompt in
                                     showWelcome = false
                                     appState.startAgentExecution(prompt)
@@ -193,6 +207,54 @@ struct RootView: View {
                     Image(systemName: "clock.arrow.circlepath")
                 }
                 .help("Histórico (⌘Y)")
+
+                Button {
+                    showCockpit = true
+                } label: {
+                    Image(systemName: "square.grid.2x2")
+                }
+                .help("Cockpit multi-repo (⌘⇧K)")
+
+                Button {
+                    showExecutionTimeline = true
+                } label: {
+                    Image(systemName: "list.bullet.rectangle.portrait")
+                }
+                .help("Execution Timeline (⌘⇧T)")
+
+                Button {
+                    captureAppScreenshot()
+                } label: {
+                    Image(systemName: "camera.fill")
+                }
+                .help("Screenshot do App")
+            }
+        }
+        .sheet(isPresented: $showExecutionTimeline) {
+            ExecutionTimelineView()
+                .frame(minWidth: 800, minHeight: 500)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Fechar") { showExecutionTimeline = false }
+                    }
+                }
+        }
+        .sheet(isPresented: $showCockpit) {
+            CockpitView()
+                .environmentObject(appState)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Fechar") { showCockpit = false }
+                    }
+                }
+        }
+        .sheet(isPresented: $appState.isShowingDryRunPreview) {
+            if let plan = appState.pendingDryRunPlan {
+                DryRunPreviewView(
+                    plan: plan,
+                    onApprove: { appState.approveDryRun() },
+                    onCancel: { appState.cancelDryRun() }
+                )
             }
         }
         .sheet(isPresented: $appState.isShowingSudoPrompt) {
@@ -292,6 +354,18 @@ struct RootView: View {
                 return nil
             }
 
+            // ⌘⇧T: execution timeline
+            if cmd && event.modifierFlags.contains(.shift) && event.charactersIgnoringModifiers?.lowercased() == "t" {
+                showExecutionTimeline.toggle()
+                return nil
+            }
+
+            // ⌘⇧K: Cockpit multi-repo
+            if cmd && event.modifierFlags.contains(.shift) && event.charactersIgnoringModifiers?.lowercased() == "k" {
+                showCockpit.toggle()
+                return nil
+            }
+
             // ⌘G: open git tab for current directory
             if cmd && event.charactersIgnoringModifiers == "g" && !opt {
                 if let dir = appState.activeTab?.currentDirectory {
@@ -321,6 +395,36 @@ struct RootView: View {
             return event
         }
     }
+
+    private func captureAppScreenshot() {
+        guard let window = NSApp.mainWindow else { return }
+        guard let cgImage = CGWindowListCreateImage(
+            .null,
+            .optionIncludingWindow,
+            CGWindowID(window.windowNumber),
+            [.boundsIgnoreFraming]
+        ) else { return }
+
+        let bitmap = NSBitmapImageRep(cgImage: cgImage)
+        guard let pngData = bitmap.representation(using: .png, properties: [:]) else { return }
+
+        let panel = NSSavePanel()
+        panel.title = "Salvar Screenshot"
+        panel.allowedContentTypes = [.png]
+        panel.nameFieldStringValue = "NexifyTerm-\(Self.screenshotDateFormatter.string(from: Date())).png"
+        panel.canCreateDirectories = true
+
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            try? pngData.write(to: url)
+        }
+    }
+
+    private static let screenshotDateFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd-HHmmss"
+        return f
+    }()
 
     private func sendCompletionNotification() {
         let summary = appState.agentStatus ?? "Pronto"

@@ -30,6 +30,19 @@ struct FileExplorerView: View {
     @State private var clipboardPasteFileName = ""
     @State private var clipboardPasteType: FileItemProvider.ClipboardContentType = .none
 
+    // Marquee selection (rubber-band) — track start/current points and per-item frames.
+    @State private var marqueeStart: CGPoint?
+    @State private var marqueeCurrent: CGPoint?
+    @State private var marqueeAnchor: Set<String> = []
+    @State private var rowFrames: [String: CGRect] = [:]
+
+    // Batch results feedback
+    @State private var batchMessage: String?
+    @State private var showBatchProgress = false
+
+    // Recorder sheet
+    @State private var showRecorder = false
+
     init(directory: String) {
         self.directory = directory
         _provider = StateObject(wrappedValue: FileItemProvider(url: URL(fileURLWithPath: directory)))
@@ -37,9 +50,14 @@ struct FileExplorerView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            FileExplorerPathBar(url: provider.currentURL) { url in
-                navigateTo(url)
-            }
+            FileExplorerPathBar(
+                url: provider.currentURL,
+                onNavigate: { url in navigateTo(url) },
+                onDropToSegment: { destination, providers in
+                    handleDrop(providers: providers, destination: destination)
+                    return true
+                }
+            )
 
             Divider()
 
@@ -60,6 +78,7 @@ struct FileExplorerView: View {
                 },
                 onAttachSelected: attachSelected,
                 onRefresh: { provider.load() },
+                onRecord: { showRecorder = true },
                 selectedCount: selectedItems.count
             )
             .environmentObject(appState)
@@ -144,6 +163,18 @@ struct FileExplorerView: View {
         }
         .background(NexTheme.bg)
         .onAppear { provider.load() }
+        // Wave 1 · C3: keep the provider in sync when the owning tab navigates
+        // externally (sidebar, URL handler, agent file actions in mosaic). Without
+        // this, the explorer kept showing the directory it was first mounted with
+        // even though `tab.currentDirectory` had moved on.
+        .onChange(of: directory) { newPath in
+            let newURL = URL(fileURLWithPath: newPath)
+            guard newURL.standardizedFileURL != provider.currentURL.standardizedFileURL else { return }
+            provider.navigate(to: newURL)
+            navigationHistory.removeAll()
+            forwardHistory.removeAll()
+            selectedItems.removeAll()
+        }
         .alert("Nova Pasta", isPresented: $showNewFolderAlert) {
             TextField("Nome da pasta", text: $newFolderName)
             Button("Criar") {
@@ -173,6 +204,21 @@ struct FileExplorerView: View {
             Button("Cancelar", role: .cancel) { itemsToDelete = [] }
         } message: {
             Text("Excluir \(itemsToDelete.count) item(ns) permanentemente?\nEsta ação não pode ser desfeita.")
+        }
+        .alert("Operação em lote", isPresented: $showBatchProgress, presenting: batchMessage) { _ in
+            Button("OK", role: .cancel) { batchMessage = nil }
+        } message: { msg in
+            Text(msg)
+        }
+        .sheet(isPresented: $showRecorder) {
+            RecorderPanel(
+                suggestedDirectory: provider.currentURL,
+                onTranscribe: { url in
+                    showRecorder = false
+                    runTranscriptionAfterRecording(url: url)
+                },
+                onClose: { showRecorder = false }
+            )
         }
         .alert(
             clipboardPasteType == .image ? "Salvar Imagem do Clipboard" : "Salvar Texto do Clipboard",
@@ -330,21 +376,39 @@ struct FileExplorerView: View {
             }
         }
         .contentShape(Rectangle())
+        .onDrag {
+            let urls = dragURLs(for: item)
+            if urls.count > 1 {
+                let provider = NSItemProvider()
+                for url in urls {
+                    provider.registerObject(url as NSURL, visibility: .all)
+                }
+                return provider
+            }
+            return NSItemProvider(object: (urls.first ?? item.url) as NSURL)
+        }
         .onTapGesture { handleTap(item) }
         .onTapGesture(count: 2) { handleDoubleTap(item) }
         .contextMenu {
             FileContextMenu(
                 item: item,
                 provider: provider,
+                selectedItems: selectedFileItems(includingFallback: item),
+                currentDirectory: provider.currentURL,
                 onRename: { startRename(item) },
                 onAttach: { attachFile(item) },
                 onDelete: {
-                    itemsToDelete = [item]
+                    itemsToDelete = selectedFileItems(includingFallback: item)
                     showDeleteConfirm = true
                 },
                 onPermanentDelete: {
-                    itemsToDelete = [item]
+                    itemsToDelete = selectedFileItems(includingFallback: item)
                     showPermanentDeleteConfirm = true
+                },
+                onBatchResult: { message in
+                    batchMessage = message
+                    showBatchProgress = true
+                    provider.load()
                 }
             )
             .environmentObject(appState)
@@ -399,12 +463,96 @@ struct FileExplorerView: View {
 
     private var fileList: some View {
         ScrollView {
-            LazyVStack(spacing: 0) {
-                ForEach(provider.items) { item in
-                    fileRow(item)
+            ZStack(alignment: .topLeading) {
+                // Background tap = deselect / Cmd+A select all anchor.
+                Color.clear
+                    .contentShape(Rectangle())
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .onTapGesture { selectedItems.removeAll() }
+
+                LazyVStack(spacing: 0) {
+                    ForEach(provider.items) { item in
+                        fileRow(item)
+                            .background(
+                                GeometryReader { geo in
+                                    Color.clear.preference(
+                                        key: RowFramesPreferenceKey.self,
+                                        value: [item.id: geo.frame(in: .named("fileListSpace"))]
+                                    )
+                                }
+                            )
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .topLeading)
+
+                if let rect = marqueeRect {
+                    Rectangle()
+                        .fill(NexTheme.accent.opacity(0.12))
+                        .overlay(
+                            Rectangle().stroke(NexTheme.accent.opacity(0.6), lineWidth: 1)
+                        )
+                        .frame(width: rect.width, height: rect.height)
+                        .offset(x: rect.minX, y: rect.minY)
+                        .allowsHitTesting(false)
                 }
             }
         }
+        .coordinateSpace(name: "fileListSpace")
+        .onPreferenceChange(RowFramesPreferenceKey.self) { rowFrames = $0 }
+        .gesture(marqueeDragGesture)
+        .onKeyboardShortcut("a", modifiers: .command) {
+            selectedItems = Set(provider.items.map(\.id))
+        }
+    }
+
+    private var marqueeRect: CGRect? {
+        guard let start = marqueeStart, let current = marqueeCurrent else { return nil }
+        return CGRect(
+            x: min(start.x, current.x),
+            y: min(start.y, current.y),
+            width: abs(current.x - start.x),
+            height: abs(current.y - start.y)
+        )
+    }
+
+    private var marqueeDragGesture: some Gesture {
+        DragGesture(minimumDistance: 6, coordinateSpace: .named("fileListSpace"))
+            .onChanged { value in
+                // Skip if drag started on a row (so .onDrag still works for files).
+                let startedOnRow = rowFrames.contains { $0.value.contains(value.startLocation) }
+                if marqueeStart == nil {
+                    if startedOnRow { return }
+                    marqueeStart = value.startLocation
+                    let mods = NSEvent.modifierFlags
+                    marqueeAnchor = (mods.contains(.shift) || mods.contains(.command)) ? selectedItems : []
+                }
+                marqueeCurrent = value.location
+
+                guard let rect = marqueeRect else { return }
+                let hitIds = rowFrames
+                    .filter { $0.value.intersects(rect) }
+                    .map(\.key)
+                selectedItems = marqueeAnchor.union(hitIds)
+            }
+            .onEnded { _ in
+                marqueeStart = nil
+                marqueeCurrent = nil
+                marqueeAnchor = []
+            }
+    }
+
+    /// URLs to drag when user starts dragging an item. If the item is already
+    /// part of the multi-selection, drag the whole selection; otherwise just
+    /// drag that single item (and update selection to match).
+    private func dragURLs(for item: FileItem) -> [URL] {
+        if selectedItems.contains(item.id) && selectedItems.count > 1 {
+            return provider.items
+                .filter { selectedItems.contains($0.id) }
+                .map(\.url)
+        }
+        selectedItems = [item.id]
+        lastClickedItemId = item.id
+        return [item.url]
     }
 
     private func fileRow(_ item: FileItem) -> some View {
@@ -464,7 +612,15 @@ struct FileExplorerView: View {
         )
         .contentShape(Rectangle())
         .onDrag {
-            NSItemProvider(object: item.url as NSURL)
+            let urls = dragURLs(for: item)
+            if urls.count > 1 {
+                let provider = NSItemProvider()
+                for url in urls {
+                    provider.registerObject(url as NSURL, visibility: .all)
+                }
+                return provider
+            }
+            return NSItemProvider(object: (urls.first ?? item.url) as NSURL)
         }
         .if(item.isDirectory) { view in
             view.onDrop(of: [.fileURL], isTargeted: nil) { providers in
@@ -482,15 +638,22 @@ struct FileExplorerView: View {
             FileContextMenu(
                 item: item,
                 provider: provider,
+                selectedItems: selectedFileItems(includingFallback: item),
+                currentDirectory: provider.currentURL,
                 onRename: { startRename(item) },
                 onAttach: { attachFile(item) },
                 onDelete: {
-                    itemsToDelete = [item]
+                    itemsToDelete = selectedFileItems(includingFallback: item)
                     showDeleteConfirm = true
                 },
                 onPermanentDelete: {
-                    itemsToDelete = [item]
+                    itemsToDelete = selectedFileItems(includingFallback: item)
                     showPermanentDeleteConfirm = true
+                },
+                onBatchResult: { message in
+                    batchMessage = message
+                    showBatchProgress = true
+                    provider.load()
                 }
             )
             .environmentObject(appState)
@@ -603,12 +766,7 @@ struct FileExplorerView: View {
         forwardHistory.removeAll()
         provider.navigate(to: url)
         selectedItems.removeAll()
-
-        if var tab = appState.activeTab, tab.isExplorer {
-            tab.currentDirectory = url.path
-            tab.title = url.lastPathComponent
-            appState.activeTab = tab
-        }
+        syncTabDirectory(url, updateTitle: true)
         RecentDirectoriesStore.shared.add(url.path)
     }
 
@@ -617,7 +775,7 @@ struct FileExplorerView: View {
         forwardHistory.append(provider.currentURL)
         provider.navigate(to: prev)
         selectedItems.removeAll()
-        syncTabDirectory(prev)
+        syncTabDirectory(prev, updateTitle: true)
     }
 
     private func goForward() {
@@ -625,7 +783,7 @@ struct FileExplorerView: View {
         navigationHistory.append(provider.currentURL)
         provider.navigate(to: next)
         selectedItems.removeAll()
-        syncTabDirectory(next)
+        syncTabDirectory(next, updateTitle: true)
     }
 
     private func goUp() {
@@ -634,12 +792,19 @@ struct FileExplorerView: View {
         navigateTo(parent)
     }
 
-    private func syncTabDirectory(_ url: URL) {
-        if var tab = appState.activeTab, tab.isExplorer {
-            tab.currentDirectory = url.path
+    /// Wave 1 · C3: sync tab directory after explorer navigation. We used to gate
+    /// this on `tab.isExplorer`, which left mosaic tabs (and the agent that reads
+    /// `tab.currentDirectory`) pointing at the original directory forever. Now we
+    /// always sync the cwd; the title is only retitled in pure-explorer tabs so we
+    /// don't overwrite a user-given mosaic title.
+    private func syncTabDirectory(_ url: URL, updateTitle: Bool) {
+        guard var tab = appState.activeTab else { return }
+        guard tab.currentDirectory != url.path else { return }
+        tab.currentDirectory = url.path
+        if updateTitle && tab.isExplorer {
             tab.title = url.lastPathComponent
-            appState.activeTab = tab
         }
+        appState.activeTab = tab
     }
 
     // MARK: - Drag & Drop
@@ -649,11 +814,16 @@ struct FileExplorerView: View {
             p.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
                 guard let data = data as? Data,
                       let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                guard sourceURL != destination,
-                      sourceURL.deletingLastPathComponent() != destination || false else { return }
-                let dest = destination.appendingPathComponent(sourceURL.lastPathComponent)
+                let normalizedSource = sourceURL.standardizedFileURL
+                let normalizedDest = destination.standardizedFileURL
+                // Skip no-ops: dropping a file in its own parent directory,
+                // or dropping a directory onto itself.
+                guard normalizedSource != normalizedDest,
+                      normalizedSource.deletingLastPathComponent() != normalizedDest
+                else { return }
+                let dest = normalizedDest.appendingPathComponent(normalizedSource.lastPathComponent)
                 DispatchQueue.main.async {
-                    try? FileManager.default.moveItem(at: sourceURL, to: dest)
+                    try? FileManager.default.moveItem(at: normalizedSource, to: dest)
                     provider.load()
                 }
             }
@@ -693,6 +863,43 @@ struct FileExplorerView: View {
             .joined(separator: "\n")
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(paths, forType: .string)
+    }
+
+    private func runTranscriptionAfterRecording(url: URL) {
+        let apiKey = ConfigStore.shared.openAIAPIKey
+        guard !apiKey.isEmpty else {
+            batchMessage = "Chave da OpenAI não configurada. Defina em Configurações → IA."
+            showBatchProgress = true
+            return
+        }
+        batchMessage = "Iniciando transcrição de \(url.lastPathComponent)... (pode demorar alguns minutos)"
+        showBatchProgress = true
+        Task {
+            do {
+                let output = try await MediaTranscriptionPipeline.runFullTranscription(for: url) { _ in }
+                await MainActor.run {
+                    batchMessage = "Transcrição salva: \(output.lastPathComponent)"
+                    showBatchProgress = true
+                    NSWorkspace.shared.activateFileViewerSelecting([output])
+                    provider.load()
+                }
+            } catch {
+                await MainActor.run {
+                    batchMessage = "Falha na transcrição: \(error.localizedDescription)"
+                    showBatchProgress = true
+                }
+            }
+        }
+    }
+
+    /// Returns currently selected items. If selection is empty (e.g. user
+    /// right-clicked an unselected item), falls back to that single item.
+    private func selectedFileItems(includingFallback item: FileItem) -> [FileItem] {
+        let selected = provider.items.filter { selectedItems.contains($0.id) }
+        if selected.isEmpty || !selected.contains(where: { $0.id == item.id }) {
+            return [item]
+        }
+        return selected
     }
 
     // MARK: - Explorer Search Results
@@ -830,5 +1037,25 @@ private extension View {
         } else {
             self
         }
+    }
+
+    /// Attaches an invisible button that fires `action` when the keyboard
+    /// shortcut is pressed while this view is in the responder chain.
+    func onKeyboardShortcut(_ key: KeyEquivalent, modifiers: EventModifiers, action: @escaping () -> Void) -> some View {
+        background(
+            Button("", action: action)
+                .keyboardShortcut(key, modifiers: modifiers)
+                .hidden()
+                .frame(width: 0, height: 0)
+        )
+    }
+}
+
+// MARK: - Row frame tracking for marquee selection
+
+struct RowFramesPreferenceKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { _, b in b })
     }
 }

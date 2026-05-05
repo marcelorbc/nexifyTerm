@@ -15,7 +15,7 @@ struct AzureDevOpsProvider: RemoteGitProvider {
     // MARK: - Repositories
 
     func repositories(query: String?, page: Int, perPage: Int) async throws -> [RemoteRepository] {
-        let url = "\(baseURL)/_apis/git/repositories?api-version=7.1"
+        let url = "\(baseURL)/_apis/git/repositories?api-version=7.1-preview.1"
         let (data, _) = try await RemoteHTTP.request(url: url, token: token, provider: .azureDevOps)
         let result = try JSONDecoder.azure.decode(AzureRepoListResponse.self, from: data)
 
@@ -36,7 +36,7 @@ struct AzureDevOpsProvider: RemoteGitProvider {
 
     func branches(repo: String) async throws -> [String] {
         let repoName = repo.components(separatedBy: "/").last ?? repo
-        let url = "\(baseURL)/_apis/git/repositories/\(repoName)/refs?filter=heads/&api-version=7.1"
+        let url = "\(baseURL)/_apis/git/repositories/\(repoName)/refs?filter=heads/&api-version=7.1-preview.1"
         let (data, _) = try await RemoteHTTP.request(url: url, token: token, provider: .azureDevOps)
         let result = try JSONDecoder.azure.decode(AzureRefListResponse.self, from: data)
         return result.value.compactMap { ref in
@@ -51,7 +51,7 @@ struct AzureDevOpsProvider: RemoteGitProvider {
     func fileTree(repo: String, path: String, ref: String) async throws -> [RemoteFileNode] {
         let repoName = repo.components(separatedBy: "/").last ?? repo
         let scopePath = path.isEmpty ? "/" : "/\(path)"
-        let url = "\(baseURL)/_apis/git/repositories/\(repoName)/items?scopePath=\(scopePath)&recursionLevel=OneLevel&versionDescriptor.version=\(ref)&api-version=7.1"
+        let url = "\(baseURL)/_apis/git/repositories/\(repoName)/items?scopePath=\(scopePath)&recursionLevel=OneLevel&versionDescriptor.version=\(ref)&api-version=7.1-preview.1"
         let (data, _) = try await RemoteHTTP.request(url: url, token: token, provider: .azureDevOps)
         let result = try JSONDecoder.azure.decode(AzureItemListResponse.self, from: data)
 
@@ -70,7 +70,7 @@ struct AzureDevOpsProvider: RemoteGitProvider {
 
     func fileContent(repo: String, path: String, ref: String) async throws -> String {
         let repoName = repo.components(separatedBy: "/").last ?? repo
-        let url = "\(baseURL)/_apis/git/repositories/\(repoName)/items?path=/\(path)&versionDescriptor.version=\(ref)&api-version=7.1"
+        let url = "\(baseURL)/_apis/git/repositories/\(repoName)/items?path=/\(path)&versionDescriptor.version=\(ref)&api-version=7.1-preview.1"
         let (data, _) = try await RemoteHTTP.request(
             url: url,
             token: token,
@@ -94,7 +94,7 @@ struct AzureDevOpsProvider: RemoteGitProvider {
         case .merged: statusParam = "&searchCriteria.status=completed"
         case nil: statusParam = ""
         }
-        let url = "\(baseURL)/_apis/git/repositories/\(repoName)/pullrequests?api-version=7.1\(statusParam)&$top=30"
+        let url = "\(baseURL)/_apis/git/repositories/\(repoName)/pullrequests?api-version=7.1-preview.1\(statusParam)&$top=30"
         let (data, _) = try await RemoteHTTP.request(url: url, token: token, provider: .azureDevOps)
         let result = try JSONDecoder.azure.decode(AzurePRListResponse.self, from: data)
         return result.value.map { $0.toRemotePR(org: account.organization ?? account.username) }
@@ -106,7 +106,7 @@ struct AzureDevOpsProvider: RemoteGitProvider {
         let stateFilter = state == .open ? "AND [System.State] <> 'Closed'" : state == .closed ? "AND [System.State] = 'Closed'" : ""
         let wiql = "SELECT [System.Id] FROM WorkItems WHERE [System.WorkItemType] IN ('Bug','Task','User Story','Issue') \(stateFilter) ORDER BY [System.ChangedDate] DESC"
 
-        let wiqlURL = "\(baseURL)/_apis/wit/wiql?api-version=7.1&$top=30"
+        let wiqlURL = "\(baseURL)/_apis/wit/wiql?api-version=7.1-preview.2&$top=30"
 
         guard let url = URL(string: wiqlURL) else {
             throw RemoteGitError.networkError("URL inválida")
@@ -128,7 +128,7 @@ struct AzureDevOpsProvider: RemoteGitProvider {
         guard !wiqlResult.workItems.isEmpty else { return [] }
 
         let ids = wiqlResult.workItems.prefix(30).map { String($0.id) }.joined(separator: ",")
-        let detailURL = "\(baseURL)/_apis/wit/workitems?ids=\(ids)&fields=System.Id,System.Title,System.State,System.CreatedBy,System.CreatedDate,System.Tags,System.WorkItemType&api-version=7.1"
+        let detailURL = "\(baseURL)/_apis/wit/workitems?ids=\(ids)&fields=System.Id,System.Title,System.State,System.CreatedBy,System.CreatedDate,System.Tags,System.WorkItemType&api-version=7.1-preview.3"
         let (detailData, _) = try await RemoteHTTP.request(url: detailURL, token: token, provider: .azureDevOps)
         let details = try JSONDecoder.azure.decode(AzureWorkItemListResponse.self, from: detailData)
 

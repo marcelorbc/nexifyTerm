@@ -38,6 +38,11 @@ struct HistoryEntry: Identifiable, Codable {
     let summary: String?
     let plan: AgentPlan?
     let stepOutputs: [HistoryStepOutput]?
+    /// Tab the entry was produced in. Optional so legacy entries keep loading.
+    let tabId: UUID?
+    /// Human-friendly tab title at the moment the entry was saved (so we can
+    /// still label closed tabs in the history).
+    let tabTitle: String?
 
     init(
         id: UUID = UUID(),
@@ -47,7 +52,9 @@ struct HistoryEntry: Identifiable, Codable {
         commands: [String] = [],
         summary: String? = nil,
         plan: AgentPlan? = nil,
-        stepOutputs: [HistoryStepOutput]? = nil
+        stepOutputs: [HistoryStepOutput]? = nil,
+        tabId: UUID? = nil,
+        tabTitle: String? = nil
     ) {
         self.id = id
         self.timestamp = timestamp
@@ -57,6 +64,8 @@ struct HistoryEntry: Identifiable, Codable {
         self.summary = summary
         self.plan = plan
         self.stepOutputs = stepOutputs
+        self.tabId = tabId
+        self.tabTitle = tabTitle
     }
 
     var timeFormatted: String {

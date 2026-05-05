@@ -5,16 +5,31 @@ struct FileActionResult {
     let action: FileAction
     let success: Bool
     let message: String
+    /// Step gravado no ExecutionLogStore; preenchido quando passamos `recorder`.
+    var stepId: UUID?
+}
+
+/// Contexto opcional de gravação na Execution Timeline.
+/// Quando passado, cada `FileAction` vira um `ExecutionStep` com rollback
+/// quando aplicável.
+struct FileActionRecorder {
+    let sessionId: UUID
+    let tabId: String?
+    let userPrompt: String?
 }
 
 struct FileActionExecutor {
 
-    static func execute(actions: [FileAction], directory: String) async -> [FileActionResult] {
+    static func execute(
+        actions: [FileAction],
+        directory: String,
+        recorder: FileActionRecorder? = nil
+    ) async -> [FileActionResult] {
         var results: [FileActionResult] = []
         let baseURL = URL(fileURLWithPath: directory)
 
         for action in actions {
-            let result = executeSingle(action, baseURL: baseURL)
+            let result = executeSingle(action, baseURL: baseURL, recorder: recorder)
             results.append(result)
 
             if !result.success {
@@ -25,7 +40,11 @@ struct FileActionExecutor {
         return results
     }
 
-    private static func executeSingle(_ action: FileAction, baseURL: URL) -> FileActionResult {
+    private static func executeSingle(
+        _ action: FileAction,
+        baseURL: URL,
+        recorder: FileActionRecorder?
+    ) -> FileActionResult {
         let params = action.params ?? [:]
         let fm = FileManager.default
 
@@ -35,11 +54,16 @@ struct FileActionExecutor {
                 return FileActionResult(action: action, success: false, message: "Nome da pasta não especificado")
             }
             let dest = baseURL.appendingPathComponent(name)
-            do {
+            return runRecorded(
+                action: action,
+                recorder: recorder,
+                kind: .fileCreateFolder,
+                title: "Criar pasta: \(name)",
+                paths: [dest.path],
+                risk: .low
+            ) { _ in
                 try fm.createDirectory(at: dest, withIntermediateDirectories: true)
-                return FileActionResult(action: action, success: true, message: "Pasta criada: \(name)")
-            } catch {
-                return FileActionResult(action: action, success: false, message: "Erro ao criar pasta: \(error.localizedDescription)")
+                return ("Pasta criada: \(name)", RollbackStore.shared.rollbackForCreated(path: dest.path))
             }
 
         case "rename":
@@ -48,11 +72,17 @@ struct FileActionExecutor {
             }
             let source = baseURL.appendingPathComponent(oldName)
             let dest = baseURL.appendingPathComponent(newName)
-            do {
+            return runRecorded(
+                action: action,
+                recorder: recorder,
+                kind: .fileRename,
+                title: "Renomear: \(oldName) → \(newName)",
+                paths: [source.path, dest.path],
+                risk: .medium
+            ) { _ in
                 try fm.moveItem(at: source, to: dest)
-                return FileActionResult(action: action, success: true, message: "Renomeado: \(oldName) → \(newName)")
-            } catch {
-                return FileActionResult(action: action, success: false, message: "Erro ao renomear: \(error.localizedDescription)")
+                let rb = RollbackStore.shared.rollbackForMove(from: dest.path, originalPath: source.path)
+                return ("Renomeado: \(oldName) → \(newName)", rb)
             }
 
         case "delete":
@@ -60,17 +90,29 @@ struct FileActionExecutor {
             guard !files.isEmpty else {
                 return FileActionResult(action: action, success: false, message: "Nenhum arquivo para deletar")
             }
+            // Gera um step por arquivo deletado (cada um com seu rollback de "restoreFromTrash").
+            var aggregateMessage = ""
             var deleted = 0
+            var lastStepId: UUID?
             for file in files {
                 let url = baseURL.appendingPathComponent(file)
-                do {
+                let result = runRecorded(
+                    action: action,
+                    recorder: recorder,
+                    kind: .fileDelete,
+                    title: "Mover para Lixeira: \(file)",
+                    paths: [url.path],
+                    risk: .high
+                ) { _ in
                     try fm.trashItem(at: url, resultingItemURL: nil)
-                    deleted += 1
-                } catch {
-                    NexLog.ai.warning("Failed to trash \(file): \(error.localizedDescription)")
+                    return ("Movido para Lixeira: \(file)",
+                            RollbackStore.shared.rollbackForTrashDelete(originalPath: url.path))
                 }
+                if result.success { deleted += 1 }
+                lastStepId = result.stepId
             }
-            return FileActionResult(action: action, success: deleted > 0, message: "\(deleted) arquivo(s) movido(s) para a Lixeira")
+            aggregateMessage = "\(deleted)/\(files.count) arquivo(s) movido(s) para a Lixeira"
+            return FileActionResult(action: action, success: deleted > 0, message: aggregateMessage, stepId: lastStepId)
 
         case "move":
             let files = parseFileList(params["files"] ?? "")
@@ -86,17 +128,26 @@ struct FileActionExecutor {
             }
 
             var moved = 0
+            var lastStepId: UUID?
             for file in files {
                 let source = baseURL.appendingPathComponent(file)
                 let dest = destURL.appendingPathComponent(URL(fileURLWithPath: file).lastPathComponent)
-                do {
+                let result = runRecorded(
+                    action: action,
+                    recorder: recorder,
+                    kind: .fileMove,
+                    title: "Mover: \(file) → \(destURL.lastPathComponent)/",
+                    paths: [source.path, dest.path],
+                    risk: .medium
+                ) { _ in
                     try fm.moveItem(at: source, to: dest)
-                    moved += 1
-                } catch {
-                    NexLog.ai.warning("Failed to move \(file): \(error.localizedDescription)")
+                    let rb = RollbackStore.shared.rollbackForMove(from: dest.path, originalPath: source.path)
+                    return ("Movido: \(file)", rb)
                 }
+                if result.success { moved += 1 }
+                lastStepId = result.stepId
             }
-            return FileActionResult(action: action, success: moved > 0, message: "\(moved) arquivo(s) movido(s)")
+            return FileActionResult(action: action, success: moved > 0, message: "\(moved)/\(files.count) arquivo(s) movido(s)", stepId: lastStepId)
 
         case "duplicate":
             guard let file = params["file"] else {
@@ -107,11 +158,17 @@ struct FileActionExecutor {
             let base = source.deletingPathExtension().lastPathComponent
             let copyName = ext.isEmpty ? "\(base) copy" : "\(base) copy.\(ext)"
             let dest = source.deletingLastPathComponent().appendingPathComponent(copyName)
-            do {
+            return runRecorded(
+                action: action,
+                recorder: recorder,
+                kind: .fileDuplicate,
+                title: "Duplicar: \(file)",
+                paths: [source.path, dest.path],
+                risk: .low
+            ) { _ in
                 try fm.copyItem(at: source, to: dest)
-                return FileActionResult(action: action, success: true, message: "Duplicado: \(file) → \(copyName)")
-            } catch {
-                return FileActionResult(action: action, success: false, message: "Erro ao duplicar: \(error.localizedDescription)")
+                return ("Duplicado: \(file) → \(copyName)",
+                        RollbackStore.shared.rollbackForCreated(path: dest.path))
             }
 
         case "openterminal":
@@ -168,6 +225,83 @@ struct FileActionExecutor {
 
         default:
             return FileActionResult(action: action, success: false, message: "Ação desconhecida: \(action.type)")
+        }
+    }
+
+    /// Executa `body` envolvendo num step da Execution Timeline (quando há `recorder`).
+    /// Cria step .running antes, .completed/.failed depois, com rollback se houver.
+    private static func runRecorded(
+        action: FileAction,
+        recorder: FileActionRecorder?,
+        kind: ExecutionStepKind,
+        title: String,
+        paths: [String],
+        risk: RiskLevel,
+        body: (UUID) throws -> (message: String, rollback: RollbackOperation?)
+    ) -> FileActionResult {
+        let stepId = UUID()
+
+        if let recorder {
+            let step = ExecutionStep(
+                id: stepId,
+                sessionId: recorder.sessionId,
+                tabId: recorder.tabId,
+                kind: kind,
+                title: title,
+                detail: action.reason ?? "",
+                risk: risk,
+                dryRun: false,
+                status: .running,
+                affectedPaths: paths,
+                userPrompt: recorder.userPrompt
+            )
+            ExecutionLogStore.shared.upsert(step)
+        }
+
+        do {
+            let (message, rollback) = try body(stepId)
+
+            if recorder != nil {
+                var updated = ExecutionStep(
+                    id: stepId,
+                    sessionId: recorder!.sessionId,
+                    tabId: recorder!.tabId,
+                    kind: kind,
+                    title: title,
+                    detail: action.reason ?? "",
+                    risk: risk,
+                    dryRun: false,
+                    status: .completed,
+                    output: message,
+                    affectedPaths: paths,
+                    userPrompt: recorder!.userPrompt
+                )
+                updated.rollback = rollback
+                ExecutionLogStore.shared.upsert(updated)
+            }
+
+            return FileActionResult(action: action, success: true, message: message, stepId: stepId)
+        } catch {
+            let errMsg = "Erro: \(error.localizedDescription)"
+            if recorder != nil {
+                let failed = ExecutionStep(
+                    id: stepId,
+                    sessionId: recorder!.sessionId,
+                    tabId: recorder!.tabId,
+                    kind: kind,
+                    title: title,
+                    detail: action.reason ?? "",
+                    risk: risk,
+                    dryRun: false,
+                    status: .failed,
+                    output: "",
+                    errorMessage: errMsg,
+                    affectedPaths: paths,
+                    userPrompt: recorder!.userPrompt
+                )
+                ExecutionLogStore.shared.upsert(failed)
+            }
+            return FileActionResult(action: action, success: false, message: errMsg, stepId: stepId)
         }
     }
 

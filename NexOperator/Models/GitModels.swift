@@ -71,6 +71,67 @@ struct GitStash: Identifiable, Equatable {
     let branchName: String?
 }
 
+/// Files that compose a single stash plus its full diff. Loaded lazily when
+/// the user expands a stash row (we don't want N stash diffs in memory just
+/// because the sidebar is rendered).
+struct GitStashDetails: Equatable {
+    let index: Int
+    let files: [GitFileStatus]
+    /// Full unified diff for the stash (`git stash show -p`). Used by the
+    /// modal viewer.
+    let rawDiff: String
+}
+
+// MARK: - Performance Diagnostic
+
+/// Single timed measurement of a Git operation. Drives the rows in
+/// `GitPerformanceView`.
+struct GitPerfSample: Identifiable, Equatable {
+    enum Rating: String, Equatable {
+        case fast = "Rápido"
+        case medium = "Médio"
+        case slow = "Lento"
+        case error = "Erro"
+
+        var color: Color {
+            switch self {
+            case .fast:   return .green
+            case .medium: return .orange
+            case .slow:   return .red
+            case .error:  return .red
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .fast:   return "bolt.fill"
+            case .medium: return "tortoise.fill"
+            case .slow:   return "exclamationmark.triangle.fill"
+            case .error:  return "xmark.octagon.fill"
+            }
+        }
+    }
+
+    let id = UUID()
+    let label: String
+    /// Wall-clock duration of the operation, in seconds. 0 when the
+    /// measurement failed.
+    let durationSeconds: Double
+    let rating: Rating
+    /// Free-form detail (e.g. "1.234s · 2.3 MB", "Repo: .git = 145 MB").
+    let detail: String
+}
+
+struct GitPerfReport: Equatable {
+    let measuredAt: Date
+    let repoPath: String
+    let samples: [GitPerfSample]
+    /// Worst rating among all samples. Drives the headline status.
+    let overallRating: GitPerfSample.Rating
+    /// Concrete actions the user can take to improve perf.
+    let suggestions: [String]
+}
+
 // MARK: - File Status
 
 enum GitFileStatusKind: String {

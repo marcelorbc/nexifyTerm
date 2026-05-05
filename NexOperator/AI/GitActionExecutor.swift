@@ -140,7 +140,7 @@ struct GitActionExecutor {
             guard let name = params["name"] else {
                 return GitActionResult(action: action, success: false, message: "Nome da tag não especificado")
             }
-            await viewModel.createTag(name, message: params["message"])
+            await viewModel.createTag(name: name, message: params["message"])
             return GitActionResult(action: action, success: true, message: "Tag criada: \(name)")
 
         case "resetsoft":

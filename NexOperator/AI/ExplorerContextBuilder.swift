@@ -16,6 +16,27 @@ struct ExplorerContext {
 
 struct ExplorerContextBuilder {
 
+    /// Wave 5 · B1: convenience entry-point used by `AppState.buildContextExtra`
+    /// when the explorer's live `[FileItem]` array isn't reachable from the call
+    /// site. Lists the directory directly so the LLM still gets a real snapshot
+    /// (file names, types, dominant extensions, git flag) instead of an empty
+    /// string.
+    @MainActor
+    static func build(directory: String, showHidden: Bool = false) -> ExplorerContext {
+        let url = URL(fileURLWithPath: directory)
+        let opts: FileManager.DirectoryEnumerationOptions = showHidden ? [] : [.skipsHiddenFiles]
+        let urls = (try? FileManager.default.contentsOfDirectory(
+            at: url,
+            includingPropertiesForKeys: [
+                .fileSizeKey, .creationDateKey, .contentModificationDateKey,
+                .isHiddenKey, .tagNamesKey, .isSymbolicLinkKey, .isApplicationKey
+            ],
+            options: opts
+        )) ?? []
+        let items = urls.map { FileItem(url: $0) }
+        return build(directory: directory, items: items)
+    }
+
     @MainActor
     static func build(
         directory: String,

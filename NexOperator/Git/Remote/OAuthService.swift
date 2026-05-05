@@ -69,19 +69,29 @@ class OAuthService: NSObject, ObservableObject {
 
     // MARK: - GitHub OAuth (Device Flow)
 
-    func authenticateGitHub(clientId: String) async throws -> (token: String, username: String) {
-        let codeResponse = try await requestDeviceCode(clientId: clientId)
+    struct DeviceCode {
+        let deviceCode: String
+        let userCode: String
+        let verificationURL: URL
+        let interval: Int
+    }
 
-        NSWorkspace.shared.open(codeResponse.verificationURL)
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(codeResponse.userCode, forType: .string)
+    func requestGitHubDeviceCode(clientId: String) async throws -> DeviceCode {
+        let response = try await requestDeviceCode(clientId: clientId)
+        return DeviceCode(
+            deviceCode: response.deviceCode,
+            userCode: response.userCode,
+            verificationURL: response.verificationURL,
+            interval: response.interval
+        )
+    }
 
+    func completeGitHubAuth(clientId: String, deviceCode: DeviceCode) async throws -> (token: String, username: String) {
         let token = try await pollForToken(
             clientId: clientId,
-            deviceCode: codeResponse.deviceCode,
-            interval: codeResponse.interval
+            deviceCode: deviceCode.deviceCode,
+            interval: deviceCode.interval
         )
-
         let username = try await fetchGitHubUsername(token: token)
         return (token, username)
     }
@@ -209,28 +219,108 @@ class OAuthService: NSObject, ObservableObject {
     // MARK: - Azure DevOps (PAT-based for now)
 
     func validateAzureToken(organization: String, token: String) async throws -> String {
-        let url = "https://dev.azure.com/\(organization)/_apis/connectionData?api-version=7.1"
+        // Sanitiza a organização: usuários frequentemente colam a URL inteira
+        // (`https://dev.azure.com/yandev/`) no campo. O Azure devolve 404
+        // nesses casos com uma mensagem inútil — melhor extrair só o slug.
+        let cleanOrg = OAuthService.sanitizeAzureOrganization(organization)
+
+        // Azure DevOps muda periodicamente quais versões de API são GA vs
+        // preview. Em vez de hard-codar uma única, tentamos uma cadeia de
+        // versões — passamos para o caso quando a primeira reclamar de
+        // "preview" (HTTP 400 com mensagem específica).
+        let versionFallbacks = [
+            "7.1-preview.1",
+            "7.2-preview.1",
+            "6.0",
+            "5.0"
+        ]
+
         let base64 = Data(":\(token)".utf8).base64EncodedString()
 
-        guard let requestURL = URL(string: url) else {
-            throw RemoteGitError.networkError("URL inválida")
+        var data = Data()
+        var http: HTTPURLResponse? = nil
+
+        for (idx, version) in versionFallbacks.enumerated() {
+            let url = "https://dev.azure.com/\(cleanOrg)/_apis/connectionData?api-version=\(version)"
+            guard let requestURL = URL(string: url) else {
+                throw RemoteGitError.networkError("URL inválida (org='\(cleanOrg)')")
+            }
+            var request = URLRequest(url: requestURL)
+            request.setValue("Basic \(base64)", forHTTPHeaderField: "Authorization")
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+            let (d, response) = try await URLSession.shared.data(for: request)
+            guard let r = response as? HTTPURLResponse else {
+                throw RemoteGitError.networkError("Resposta sem HTTPURLResponse")
+            }
+
+            data = d
+            http = r
+
+            // Sucesso ou erro definitivo (não é preview-mismatch): para aqui.
+            // Só retentamos quando a resposta diz exatamente "under preview".
+            let bodyText = String(data: d, encoding: .utf8) ?? ""
+            let isPreviewMismatch = r.statusCode == 400 && bodyText.contains("under preview")
+            let hasMoreFallbacks = idx < versionFallbacks.count - 1
+            if r.statusCode == 200 || !isPreviewMismatch || !hasMoreFallbacks {
+                break
+            }
         }
 
-        var request = URLRequest(url: requestURL)
-        request.setValue("Basic \(base64)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        guard let http else {
+            throw RemoteGitError.networkError("Sem resposta após \(versionFallbacks.count) tentativas")
+        }
 
-        let (data, response) = try await URLSession.shared.data(for: request)
-        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
-            throw RemoteGitError.notAuthenticated
+        if http.statusCode != 200 {
+            // Surface real cause: status code + first chunk of the response
+            // body. Keeps the user out of a guessing game ("é o token?
+            // é o org?") that the previous code forced.
+            let bodyPreview = String(data: data, encoding: .utf8)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .prefix(240) ?? ""
+            // Azure devolve HTML quando o domínio aceita mas o tenant não
+            // existe — detectamos pelo Content-Type pra dar dica útil.
+            let contentType = (http.allHeaderFields["Content-Type"] as? String) ?? ""
+            let detail: String
+            switch http.statusCode {
+            case 401:
+                detail = "401 Unauthorized — token inválido, expirado ou sem o scope necessário (precisa Code: Read, no mínimo)."
+            case 403:
+                detail = "403 Forbidden — token válido mas sem permissão na organização '\(cleanOrg)'. Confira se o PAT foi gerado dentro dessa org."
+            case 404:
+                if contentType.contains("text/html") {
+                    detail = "404 — organização '\(cleanOrg)' não existe ou exige login pelo navegador. Confirme em https://dev.azure.com/\(cleanOrg)"
+                } else {
+                    detail = "404 — endpoint não encontrado para org '\(cleanOrg)'. Verifique o nome da organização."
+                }
+            case 203:
+                detail = "203 — Azure devolveu página de login HTML (token rejeitado silenciosamente). Confirme o PAT."
+            default:
+                detail = "HTTP \(http.statusCode). Resposta: \(bodyPreview.isEmpty ? "(corpo vazio)" : String(bodyPreview))"
+            }
+            throw RemoteGitError.apiFailed(http.statusCode, detail)
         }
 
         let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
         let authenticatedUser = json["authenticatedUser"] as? [String: Any] ?? [:]
         let properties = authenticatedUser["properties"] as? [String: Any] ?? [:]
         let account = properties["Account"] as? [String: Any] ?? [:]
-        let username = account["$value"] as? String ?? organization
+        let username = account["$value"] as? String ?? cleanOrg
         return username
+    }
+
+    /// Aceita "yandev", "https://dev.azure.com/yandev", "yandev/", etc.
+    /// Retorna apenas o slug. Static para que o caller também possa sanitizar
+    /// antes de persistir no keychain.
+    static func sanitizeAzureOrganization(_ raw: String) -> String {
+        var s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let range = s.range(of: "dev.azure.com/") {
+            s = String(s[range.upperBound...])
+        }
+        if let slash = s.firstIndex(of: "/") {
+            s = String(s[..<slash])
+        }
+        return s
     }
 
     // MARK: - Clone

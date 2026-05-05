@@ -14,6 +14,9 @@ struct AgentInput {
     let fileAttachments: [FileAttachment]
     let tabMode: TabMode
     let contextExtra: String
+    /// Prior turns of the conversation (this tab only). Oldest first.
+    /// Used to give the LLM short-term memory across user messages.
+    let conversationTurns: [ConversationTurn]
 
     var hasAttachment: Bool { !fileAttachments.isEmpty }
     var isGitMode: Bool { tabMode == .git }
@@ -30,7 +33,8 @@ struct AgentInput {
         mcpToolsContext: String = "",
         fileAttachments: [FileAttachment] = [],
         tabMode: TabMode = .terminal,
-        contextExtra: String = ""
+        contextExtra: String = "",
+        conversationTurns: [ConversationTurn] = []
     ) {
         self.userMessage = userMessage
         self.operatingSystem = "macOS \(ProcessInfo.processInfo.operatingSystemVersionString)"
@@ -45,5 +49,6 @@ struct AgentInput {
         self.fileAttachments = fileAttachments
         self.tabMode = tabMode
         self.contextExtra = contextExtra
+        self.conversationTurns = conversationTurns
     }
 }

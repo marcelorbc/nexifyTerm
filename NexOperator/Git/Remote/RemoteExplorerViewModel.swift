@@ -14,6 +14,20 @@ class RemoteExplorerViewModel: ObservableObject {
     @Published var filteredRepositories: [RemoteRepository] = []
     @Published var searchQuery = ""
     @Published var isLoading = false
+
+    // Tech filters / sorting (multi-repo discovery UX)
+    @Published var selectedTechFilters: Set<RepoTech> = []
+    @Published var sortOption: RepoSortOption = .nameAsc
+    @Published var isDetectingTechs = false
+    @Published var techDetectionProgress: (done: Int, total: Int) = (0, 0)
+
+    enum RepoSortOption: String, CaseIterable, Identifiable {
+        case nameAsc = "Nome A→Z"
+        case nameDesc = "Nome Z→A"
+        case updatedDesc = "Atualizado recente"
+        case updatedAsc = "Atualizado antigo"
+        var id: String { rawValue }
+    }
     @Published var errorMessage: String?
     @Published var toastMessage: String?
     @Published var toastIsError = false
@@ -50,6 +64,7 @@ class RemoteExplorerViewModel: ObservableObject {
     @Published var cloneBasePath = ""
     @Published var cloneRequests: [CloneRequest] = []
     @Published var isCloningInProgress = false
+    var defaultClonePath: String?
 
     // File browser
     @Published var fileTree: [RemoteFileNode] = []
@@ -84,25 +99,78 @@ class RemoteExplorerViewModel: ObservableObject {
 
     private func setupSearchDebounce() {
         searchDebounce = $searchQuery
-            .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
+            .debounce(for: .milliseconds(250), scheduler: RunLoop.main)
             .removeDuplicates()
-            .sink { [weak self] query in
-                guard let self else { return }
-                Task { await self.filterRepositories(query: query) }
+            .sink { [weak self] _ in
+                self?.applyFilters()
             }
     }
 
-    private func filterRepositories(query: String) async {
-        if query.isEmpty {
-            filteredRepositories = repositories
+    /// Aplica busca + filtro de tech + ordenação. Tudo é client-side: as
+    /// 200+ repos da org já estão em memória, então filtrar é quase
+    /// instantâneo (e não consome rate-limit do servidor).
+    func applyFilters() {
+        let q = searchQuery.lowercased().trimmingCharacters(in: .whitespaces)
+        let detector = RepoTechDetector.shared
+
+        var result = repositories.filter { repo in
+            // Search box: matches name, description, fullName (project/repo
+            // for Azure), language, or any detected tech label.
+            if !q.isEmpty {
+                let detectedLabels = (detector.techs(for: repo) ?? []).map { $0.label.lowercased() }
+                let hay = [
+                    repo.name,
+                    repo.fullName,
+                    repo.description ?? "",
+                    repo.language ?? "",
+                    detectedLabels.joined(separator: " ")
+                ].joined(separator: " ").lowercased()
+                if !hay.contains(q) { return false }
+            }
+
+            // Tech filter: AND-mode — repo precisa ter TODAS as techs marcadas.
+            if !selectedTechFilters.isEmpty {
+                let detected = detector.techs(for: repo) ?? []
+                if !selectedTechFilters.isSubset(of: detected) { return false }
+            }
+            return true
+        }
+
+        switch sortOption {
+        case .nameAsc:      result.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        case .nameDesc:     result.sort { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedDescending }
+        case .updatedDesc:  result.sort { $0.updatedAt > $1.updatedAt }
+        case .updatedAsc:   result.sort { $0.updatedAt < $1.updatedAt }
+        }
+
+        filteredRepositories = result
+    }
+
+    func toggleTechFilter(_ tech: RepoTech) {
+        if selectedTechFilters.contains(tech) {
+            selectedTechFilters.remove(tech)
         } else {
-            let q = query.lowercased()
-            filteredRepositories = repositories.filter {
-                $0.name.lowercased().contains(q) ||
-                ($0.description?.lowercased().contains(q) ?? false) ||
-                ($0.language?.lowercased().contains(q) ?? false)
+            selectedTechFilters.insert(tech)
+        }
+        applyFilters()
+    }
+
+    func clearTechFilters() {
+        selectedTechFilters.removeAll()
+        applyFilters()
+    }
+
+    /// Conjunto de techs detectadas em pelo menos um repo — alimenta a barra
+    /// de chips para o usuário só ver filtros relevantes.
+    var availableTechs: [RepoTech] {
+        let detector = RepoTechDetector.shared
+        var seen: Set<RepoTech> = []
+        for repo in repositories {
+            if let techs = detector.techs(for: repo) {
+                seen.formUnion(techs)
             }
         }
+        return Array(seen).sorted { $0.label.localizedCaseInsensitiveCompare($1.label) == .orderedAscending }
     }
 
     // MARK: - Account Management
@@ -137,15 +205,16 @@ class RemoteExplorerViewModel: ObservableObject {
                 org = nil
 
             case .azureDevOps:
-                guard !newAccountOrg.isEmpty else {
+                let cleanOrg = OAuthService.sanitizeAzureOrganization(newAccountOrg)
+                guard !cleanOrg.isEmpty else {
                     showToast("Organização é obrigatória para Azure DevOps", isError: true)
                     return
                 }
                 username = try await oauthService.validateAzureToken(
-                    organization: newAccountOrg,
+                    organization: cleanOrg,
                     token: newAccountToken
                 )
-                org = newAccountOrg
+                org = cleanOrg
             }
 
             let name = newAccountName.isEmpty
@@ -167,7 +236,9 @@ class RemoteExplorerViewModel: ObservableObject {
             showToast("Conta adicionada: \(name)")
             await loadRepositories()
         } catch {
-            showToast("Falha na autenticação: \(error.localizedDescription)", isError: true)
+            // Não prefixar "Falha na autenticação:" — o erro já carrega
+            // a causa real (status code + mensagem do servidor).
+            showToast(error.localizedDescription, isError: true)
         }
     }
 
@@ -202,32 +273,46 @@ class RemoteExplorerViewModel: ObservableObject {
         errorMessage = nil
 
         do {
-            repositories = try await provider.repositories()
+            // Paginar até esgotar — antes a chamada padrão limitava a 30
+            // (perPage default), criando a falsa impressão de que a org
+            // tinha apenas 30 repos.
+            repositories = try await provider.allRepositories()
             filteredRepositories = repositories
+            applyFilters()
         } catch {
             errorMessage = error.localizedDescription
         }
 
         isLoading = false
+
+        // Dispara detecção de tecnologia em background — não bloqueia a
+        // listagem. A UI atualiza linha por linha conforme os resultados
+        // chegam graças ao @Published do detector.
+        Task { await detectTechsForCurrentRepos() }
     }
 
-    func searchRepositories() async {
-        guard let provider = currentProvider else { return }
-        guard !searchQuery.isEmpty else {
-            filteredRepositories = repositories
-            return
-        }
+    /// Re-detecta techs apagando o cache primeiro. Útil quando o usuário
+    /// quer forçar refresh.
+    func redetectTechs() async {
+        RepoTechDetector.shared.clear()
+        await detectTechsForCurrentRepos()
+    }
 
-        isLoading = true
-        do {
-            let results = try await provider.repositories(query: searchQuery)
-            filteredRepositories = results
-        } catch {
-            filteredRepositories = repositories.filter {
-                $0.name.lowercased().contains(searchQuery.lowercased())
-            }
-        }
-        isLoading = false
+    private func detectTechsForCurrentRepos() async {
+        guard let provider = currentProvider, !repositories.isEmpty else { return }
+        isDetectingTechs = true
+        defer { isDetectingTechs = false }
+
+        techDetectionProgress = (0, repositories.count)
+        await RepoTechDetector.shared.detectMany(repos: repositories, provider: provider)
+        techDetectionProgress = (repositories.count, repositories.count)
+    }
+
+    /// Busca local. Antes ia ao servidor a cada submit (lento + gastava
+    /// rate-limit). Agora todos os repos já estão carregados, então filtrar
+    /// é client-side e instantâneo. Mantida para compat. com `.onSubmit`.
+    func searchRepositories() async {
+        applyFilters()
     }
 
     // MARK: - Repo Detail
@@ -358,7 +443,12 @@ class RemoteExplorerViewModel: ObservableObject {
             showToast("Selecione ao menos um repositório", isError: true)
             return
         }
-        cloneBasePath = NSHomeDirectory() + "/Developer"
+        if let path = defaultClonePath,
+           FileManager.default.fileExists(atPath: path) {
+            cloneBasePath = path
+        } else {
+            cloneBasePath = NSHomeDirectory() + "/Developer"
+        }
         cloneRequests = filteredRepositories
             .filter { selectedForClone.contains($0.id) }
             .map { CloneRequest(repository: $0, destinationPath: "") }
@@ -434,14 +524,14 @@ class RemoteExplorerViewModel: ObservableObject {
         Task {
             do {
                 let clientId = AppConfig.GitHub.oauthClientId
-                let codeResponse = try await requestGitHubDeviceCode(clientId: clientId)
+                let deviceCode = try await oauthService.requestGitHubDeviceCode(clientId: clientId)
 
-                oauthUserCode = codeResponse.userCode
-                NSWorkspace.shared.open(codeResponse.verificationURL)
+                oauthUserCode = deviceCode.userCode
+                NSWorkspace.shared.open(deviceCode.verificationURL)
                 NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(codeResponse.userCode, forType: .string)
+                NSPasteboard.general.setString(deviceCode.userCode, forType: .string)
 
-                let result = try await oauthService.authenticateGitHub(clientId: clientId)
+                let result = try await oauthService.completeGitHubAuth(clientId: clientId, deviceCode: deviceCode)
 
                 oauthService.addAccount(
                     provider: .github,
@@ -477,34 +567,6 @@ class RemoteExplorerViewModel: ObservableObject {
         if let u = URL(string: url) {
             NSWorkspace.shared.open(u)
         }
-    }
-
-    private func requestGitHubDeviceCode(clientId: String) async throws -> (userCode: String, verificationURL: URL, deviceCode: String, interval: Int) {
-        guard let url = URL(string: "https://github.com/login/device/code") else {
-            throw RemoteGitError.networkError("URL inválida")
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: [
-            "client_id": clientId,
-            "scope": "repo read:org read:user"
-        ])
-
-        let (data, _) = try await URLSession.shared.data(for: request)
-        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any] ?? [:]
-
-        guard let deviceCode = json["device_code"] as? String,
-              let userCode = json["user_code"] as? String,
-              let verificationURI = json["verification_uri"] as? String,
-              let verificationURL = URL(string: verificationURI) else {
-            throw RemoteGitError.decodingFailed("Device code response inválida")
-        }
-
-        let interval = json["interval"] as? Int ?? 5
-        return (userCode, verificationURL, deviceCode, interval)
     }
 
     // MARK: - Auto-Detection
@@ -585,12 +647,24 @@ class RemoteExplorerViewModel: ObservableObject {
     func showToast(_ message: String, isError: Bool = false) {
         toastMessage = message
         toastIsError = isError
+
+        // Mensagens longas (geralmente erros com payload do servidor) ficam
+        // persistentes até o usuário fechar manualmente — o objetivo é dar
+        // tempo de copiar e compartilhar o erro completo.
+        let isLong = isError && message.count > 80
+        if isLong { return }
+
         Task {
-            try? await Task.sleep(nanoseconds: isError ? 4_000_000_000 : 2_500_000_000)
+            // Erros: 60s (era 4s). Sucesso: 2.5s.
+            try? await Task.sleep(nanoseconds: isError ? 60_000_000_000 : 2_500_000_000)
             if toastMessage == message {
                 toastMessage = nil
             }
         }
+    }
+
+    func dismissToast() {
+        toastMessage = nil
     }
 }
 

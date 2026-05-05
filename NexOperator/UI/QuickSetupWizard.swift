@@ -937,9 +937,14 @@ struct QuickSetupWizard: View {
 
         Task {
             do {
-                let result = try await OAuthService.shared.authenticateGitHub(
-                    clientId: AppConfig.GitHub.oauthClientId
-                )
+                let clientId = AppConfig.GitHub.oauthClientId
+                let deviceCode = try await OAuthService.shared.requestGitHubDeviceCode(clientId: clientId)
+
+                NSWorkspace.shared.open(deviceCode.verificationURL)
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(deviceCode.userCode, forType: .string)
+
+                let result = try await OAuthService.shared.completeGitHubAuth(clientId: clientId, deviceCode: deviceCode)
 
                 OAuthService.shared.addAccount(
                     provider: .github,

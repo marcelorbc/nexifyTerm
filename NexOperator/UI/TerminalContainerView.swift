@@ -32,6 +32,10 @@ struct TerminalContainerView: View {
                 GitTabView(viewModel: appState.gitViewModel(for: tabId))
                     .environmentObject(appState)
                     .id(tabId)
+            case .diskAnalyzer:
+                DiskAnalyzerView(directory: tab.currentDirectory)
+                    .environmentObject(appState)
+                    .id(tabId)
             }
         } else {
             VStack(spacing: 12) {

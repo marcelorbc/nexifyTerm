@@ -88,6 +88,7 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
         }
     }
 
+    /// Static model catalogue per provider.
     var availableModels: [String] {
         switch self {
         case .ollama: return ["llama3.1", "llama3", "mistral", "codellama", "gemma2"]
@@ -248,7 +249,10 @@ enum ProviderType: String, CaseIterable, Codable, Identifiable {
     )
 
     static func capabilities(for model: String) -> ModelCapabilities {
-        capabilityMap[model] ?? defaultCapabilities
+        if let exact = capabilityMap[model] { return exact }
+        let base = model.split(separator: ":").first.map(String.init) ?? model
+        if let partial = capabilityMap[base] { return partial }
+        return defaultCapabilities
     }
 
     // MARK: - Legacy compatibility

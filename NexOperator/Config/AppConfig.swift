@@ -6,7 +6,7 @@ enum AppConfig {
 
     enum Ollama {
         static let defaultBaseURL = "http://localhost:11434"
-        static let defaultModel = "llama3.1"
+        static let defaultModel = "qwen2.5-coder:7b"
         static let chatEndpoint = "/api/chat"
     }
 
@@ -22,7 +22,7 @@ enum AppConfig {
     }
 
     enum GitHub {
-        static let oauthClientId = "Ov23liNexifyTermApp"
+        static let oauthClientId = "Ov23li7DpLMLUkfipKL3"
     }
 
     enum Defaults {

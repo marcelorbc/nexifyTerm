@@ -4,6 +4,12 @@ struct GitBranchSidebar: View {
     @ObservedObject var viewModel: GitViewModel
     @State private var isShowingNewBranch = false
     @State private var newBranchName = ""
+    @State private var isShowingNewTag = false
+    @State private var newTagSourceName: String = ""
+    @State private var isShowingPerf = false
+    @State private var isShowingHygiene = false
+    @State private var expandedStashIds: Set<Int> = []
+    @State private var stashShowingDiff: Int? = nil
     @State private var expandedSections: Set<String> = ["local", "remote", "tags"]
 
     var body: some View {
@@ -24,6 +30,18 @@ struct GitBranchSidebar: View {
             }
         }
         .background(Color(nsColor: .windowBackgroundColor))
+        .sheet(isPresented: $isShowingPerf) {
+            GitPerformanceView(viewModel: viewModel)
+        }
+        .sheet(isPresented: $isShowingHygiene) {
+            GitBranchHygieneView(viewModel: viewModel)
+        }
+        .sheet(item: stashSheetBinding) { idx in
+            GitStashDetailView(
+                viewModel: viewModel,
+                index: idx.value
+            )
+        }
     }
 
     // MARK: - Header
@@ -37,6 +55,28 @@ struct GitBranchSidebar: View {
                 .font(.system(size: 12, weight: .semibold))
                 .foregroundColor(NexTheme.textPrimary)
             Spacer()
+            Button {
+                isShowingHygiene = true
+            } label: {
+                Image(systemName: "scissors")
+                    .font(.system(size: NexTheme.iconSizeSmall, weight: .medium))
+                    .foregroundColor(NexTheme.textSecondary)
+                    .frame(width: NexTheme.hitTargetSmall, height: NexTheme.hitTargetSmall)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Higiene de branches (mergeadas / stale)")
+            Button {
+                isShowingPerf = true
+            } label: {
+                Image(systemName: "gauge.with.dots.needle.50percent")
+                    .font(.system(size: NexTheme.iconSizeSmall, weight: .medium))
+                    .foregroundColor(NexTheme.textSecondary)
+                    .frame(width: NexTheme.hitTargetSmall, height: NexTheme.hitTargetSmall)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Diagnóstico de performance Git")
             Button {
                 isShowingNewBranch = true
             } label: {
@@ -54,6 +94,15 @@ struct GitBranchSidebar: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 8)
+    }
+
+    // Wraps the optional stash id in an `Identifiable` so we can drive
+    // `.sheet(item:)` from the row's "Ver diff" button.
+    private var stashSheetBinding: Binding<IdentifiedInt?> {
+        Binding(
+            get: { stashShowingDiff.map(IdentifiedInt.init(value:)) },
+            set: { stashShowingDiff = $0?.value }
+        )
     }
 
     // MARK: - Sections
@@ -110,7 +159,32 @@ struct GitBranchSidebar: View {
     }
 
     private var tagsSection: some View {
-        CollapsibleSection(title: "TAGS", id: "tags", expandedSections: $expandedSections) {
+        CollapsibleSection(
+            title: "TAGS",
+            id: "tags",
+            expandedSections: $expandedSections,
+            trailing: AnyView(
+                Button {
+                    newTagSourceName = ""
+                    isShowingNewTag = true
+                } label: {
+                    Image(systemName: "plus")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundColor(NexTheme.textSecondary)
+                        .frame(width: 16, height: 16)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Criar nova tag")
+                .popover(isPresented: $isShowingNewTag) {
+                    NewTagPopover(
+                        viewModel: viewModel,
+                        seedTag: newTagSourceName,
+                        isPresented: $isShowingNewTag
+                    )
+                }
+            )
+        ) {
             if viewModel.tags.isEmpty {
                 Text("Nenhuma tag")
                     .font(.system(size: 11))
@@ -119,40 +193,79 @@ struct GitBranchSidebar: View {
                     .padding(.vertical, 3)
             } else {
                 ForEach(viewModel.tags) { tag in
-                    HStack(spacing: 6) {
-                        Image(systemName: "tag")
-                            .font(.system(size: 10))
-                            .foregroundColor(.orange)
-                            .frame(width: 14)
-                        Text(tag.name)
-                            .font(.system(size: 11))
-                            .foregroundColor(NexTheme.textPrimary)
-                            .lineLimit(1)
-                        Spacer()
-                        if let msg = tag.message, !msg.isEmpty {
-                            Text(msg)
-                                .font(.system(size: 9))
-                                .foregroundColor(NexTheme.textSecondary)
-                                .lineLimit(1)
+                    tagRow(tag)
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func tagRow(_ tag: GitTag) -> some View {
+        let suggestions = TagBumpSuggester.suggestions(from: tag.name)
+
+        HStack(spacing: 6) {
+            Image(systemName: "tag")
+                .font(.system(size: 10))
+                .foregroundColor(.orange)
+                .frame(width: 14)
+            Text(tag.name)
+                .font(.system(size: 11))
+                .foregroundColor(NexTheme.textPrimary)
+                .lineLimit(1)
+            Spacer()
+            if !suggestions.isEmpty {
+                // Tiny indicator that a bump is available.
+                Image(systemName: "arrow.up.forward")
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(.orange.opacity(0.6))
+            }
+            if let msg = tag.message, !msg.isEmpty {
+                Text(msg)
+                    .font(.system(size: 9))
+                    .foregroundColor(NexTheme.textSecondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 3)
+        .contentShape(Rectangle())
+        .cursorOnHover(.pointingHand)
+        .onTapGesture {
+            // Click → open the "create next" popover seeded with this tag,
+            // matching the behavior the user described in the task.
+            newTagSourceName = tag.name
+            isShowingNewTag = true
+        }
+        .contextMenu {
+            Button("Checkout tag") {
+                Task { await viewModel.checkoutTag(tag.name) }
+            }
+            Divider()
+            if suggestions.isEmpty {
+                Button("Criar nova tag a partir desta…") {
+                    newTagSourceName = tag.name
+                    isShowingNewTag = true
+                }
+            } else {
+                Section("Criar próxima tag") {
+                    ForEach(suggestions) { s in
+                        Button {
+                            Task { await viewModel.createTag(name: s.name) }
+                        } label: {
+                            Text("\(s.label) → \(s.name)")
                         }
                     }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .contentShape(Rectangle())
-                    .cursorOnHover(.pointingHand)
-                    .onTapGesture {
-                        Task { await viewModel.checkoutTag(tag.name) }
-                    }
-                    .contextMenu {
-                        Button("Checkout tag") {
-                            Task { await viewModel.checkoutTag(tag.name) }
-                        }
-                        Button("Copiar nome") {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(tag.name, forType: .string)
-                        }
+                    Divider()
+                    Button("Personalizar nome…") {
+                        newTagSourceName = tag.name
+                        isShowingNewTag = true
                     }
                 }
+            }
+            Divider()
+            Button("Copiar nome") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(tag.name, forType: .string)
             }
         }
     }
@@ -167,29 +280,138 @@ struct GitBranchSidebar: View {
                     .padding(.vertical, 3)
             } else {
                 ForEach(viewModel.stashes) { stash in
-                    HStack(spacing: 6) {
-                        Image(systemName: "tray")
-                            .font(.system(size: 10))
-                            .foregroundColor(.purple)
-                            .frame(width: 14)
-                        Text(stash.message)
-                            .font(.system(size: 11))
-                            .foregroundColor(NexTheme.textPrimary)
-                            .lineLimit(1)
-                        Spacer()
-                    }
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 3)
-                    .contextMenu {
-                        Button("Aplicar (Pop)") {
-                            Task { await viewModel.stashPop(stash.id) }
-                        }
-                        Button("Remover (Drop)") {
-                            Task { await viewModel.stashDrop(stash.id) }
-                        }
-                    }
+                    stashRow(stash)
                 }
             }
+        }
+    }
+
+    @ViewBuilder
+    private func stashRow(_ stash: GitStash) -> some View {
+        let isExpanded = expandedStashIds.contains(stash.id)
+        let details = viewModel.stashDetailsCache[stash.id]
+        let isLoading = viewModel.loadingStashDetails.contains(stash.id)
+
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 6) {
+                Button {
+                    toggleStash(stash.id)
+                } label: {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundColor(NexTheme.textSecondary)
+                        .frame(width: 12)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Image(systemName: "tray")
+                    .font(.system(size: 10))
+                    .foregroundColor(.purple)
+                    .frame(width: 14)
+
+                Text(stash.message)
+                    .font(.system(size: 11))
+                    .foregroundColor(NexTheme.textPrimary)
+                    .lineLimit(1)
+
+                Spacer()
+
+                if let count = details?.files.count {
+                    Text("\(count)")
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(NexTheme.textSecondary)
+                        .padding(.horizontal, 4)
+                        .background(NexTheme.surface)
+                        .cornerRadius(3)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .contentShape(Rectangle())
+            .onTapGesture { toggleStash(stash.id) }
+            .contextMenu {
+                Button("Ver diff completo…") { stashShowingDiff = stash.id }
+                Divider()
+                Button("Aplicar (Pop)") {
+                    Task { await viewModel.stashPop(stash.id) }
+                }
+                Button("Remover (Drop)") {
+                    Task { await viewModel.stashDrop(stash.id) }
+                }
+            }
+
+            if isExpanded {
+                stashExpandedContent(stash: stash, details: details, isLoading: isLoading)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func stashExpandedContent(stash: GitStash, details: GitStashDetails?, isLoading: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            if isLoading {
+                HStack(spacing: 6) {
+                    ProgressView().controlSize(.small)
+                    Text("Carregando arquivos…")
+                        .font(.system(size: 10))
+                        .foregroundColor(NexTheme.textSecondary)
+                }
+                .padding(.leading, 32)
+                .padding(.vertical, 3)
+            } else if let details {
+                if details.files.isEmpty {
+                    Text("Sem arquivos detectados")
+                        .font(.system(size: 10))
+                        .foregroundColor(NexTheme.textSecondary)
+                        .padding(.leading, 32)
+                        .padding(.vertical, 3)
+                } else {
+                    ForEach(details.files) { f in
+                        HStack(spacing: 4) {
+                            Image(systemName: f.status.icon)
+                                .font(.system(size: 8))
+                                .foregroundColor(f.status.color)
+                                .frame(width: 10)
+                            Text(f.path)
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundColor(NexTheme.textPrimary.opacity(0.85))
+                                .lineLimit(1)
+                                .truncationMode(.head)
+                        }
+                        .padding(.leading, 32)
+                        .padding(.vertical, 1)
+                    }
+                }
+                Button {
+                    stashShowingDiff = stash.id
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "doc.text.magnifyingglass")
+                            .font(.system(size: 9))
+                        Text("Ver diff completo")
+                            .font(.system(size: 10, weight: .medium))
+                    }
+                    .foregroundColor(.accentColor)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 24)
+                .padding(.top, 2)
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    private func toggleStash(_ id: Int) {
+        if expandedStashIds.contains(id) {
+            expandedStashIds.remove(id)
+        } else {
+            expandedStashIds.insert(id)
+            // Lazy load on first expand.
+            Task { await viewModel.loadStashDetails(id) }
         }
     }
 
@@ -308,6 +530,7 @@ struct CollapsibleSection<Content: View>: View {
     let title: String
     let id: String
     @Binding var expandedSections: Set<String>
+    var trailing: AnyView? = nil
     @ViewBuilder let content: () -> Content
 
     private var isExpanded: Bool {
@@ -316,34 +539,160 @@ struct CollapsibleSection<Content: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) {
-                    if isExpanded {
-                        expandedSections.remove(id)
-                    } else {
-                        expandedSections.insert(id)
+            HStack(spacing: 4) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.15)) {
+                        if isExpanded {
+                            expandedSections.remove(id)
+                        } else {
+                            expandedSections.insert(id)
+                        }
                     }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(NexTheme.textSecondary)
+                            .frame(width: 12)
+                        Text(title)
+                            .font(.system(size: 10, weight: .semibold))
+                            .foregroundColor(NexTheme.textSecondary)
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
                 }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(NexTheme.textSecondary)
-                        .frame(width: 12)
-                    Text(title)
-                        .font(.system(size: 10, weight: .semibold))
-                        .foregroundColor(NexTheme.textSecondary)
-                    Spacer()
-                }
-                .padding(.leading, 4)
-                .padding(.vertical, 2)
-                .contentShape(Rectangle())
+                .buttonStyle(.plain)
+                if let trailing { trailing }
             }
-            .buttonStyle(.plain)
+            .padding(.leading, 4)
+            .padding(.vertical, 2)
 
             if isExpanded {
                 content()
             }
         }
+    }
+}
+
+// Tiny wrapper so we can drive `.sheet(item:)` from a stash index without
+// having to pollute the model with Identifiable conformance.
+struct IdentifiedInt: Identifiable, Equatable {
+    let value: Int
+    var id: Int { value }
+}
+
+// MARK: - New Tag Popover
+
+/// Popover used both by the section "+" button (free-form name) and by
+/// clicking on an existing tag row (seeded with the source tag and showing
+/// quick-bump buttons).
+struct NewTagPopover: View {
+    @ObservedObject var viewModel: GitViewModel
+    let seedTag: String
+    @Binding var isPresented: Bool
+
+    @State private var name: String = ""
+    @State private var message: String = ""
+    @FocusState private var nameFocused: Bool
+
+    private var suggestions: [TagBumpSuggester.Suggestion] {
+        guard !seedTag.isEmpty else { return [] }
+        return TagBumpSuggester.suggestions(from: seedTag)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 6) {
+                Image(systemName: "tag.fill")
+                    .font(.system(size: 11))
+                    .foregroundColor(.orange)
+                Text(seedTag.isEmpty ? "Nova tag" : "Próxima tag a partir de \(seedTag)")
+                    .font(.system(size: 12, weight: .semibold))
+                Spacer()
+            }
+
+            if !suggestions.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Sugestões")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(NexTheme.textSecondary)
+                    ForEach(suggestions) { s in
+                        Button {
+                            name = s.name
+                        } label: {
+                            HStack(spacing: 6) {
+                                Text(s.label)
+                                    .font(.system(size: 10, weight: .semibold))
+                                    .foregroundColor(.orange)
+                                    .frame(width: 50, alignment: .leading)
+                                Text(s.name)
+                                    .font(.system(size: 11, design: .monospaced))
+                                    .foregroundColor(NexTheme.textPrimary)
+                                Spacer()
+                                Text(s.hint)
+                                    .font(.system(size: 9))
+                                    .foregroundColor(NexTheme.textSecondary)
+                                    .lineLimit(1)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(
+                                RoundedRectangle(cornerRadius: 4)
+                                    .fill(name == s.name ? NexTheme.accentDim : Color.clear)
+                            )
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Nome")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(NexTheme.textSecondary)
+                TextField("v1.2.3", text: $name)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 12, design: .monospaced))
+                    .focused($nameFocused)
+                    .onSubmit { commit() }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Mensagem (opcional, cria tag anotada)")
+                    .font(.system(size: 9, weight: .semibold))
+                    .foregroundColor(NexTheme.textSecondary)
+                TextField("Release notes…", text: $message)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(size: 11))
+            }
+
+            HStack {
+                Spacer()
+                Button("Cancelar") { isPresented = false }
+                    .buttonStyle(.plain)
+                Button("Criar") { commit() }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .keyboardShortcut(.defaultAction)
+                    .disabled(name.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+        .padding(14)
+        .frame(width: 360)
+        .onAppear {
+            if !suggestions.isEmpty, let first = suggestions.first {
+                name = first.name
+            }
+            nameFocused = true
+        }
+    }
+
+    private func commit() {
+        let n = name.trimmingCharacters(in: .whitespaces)
+        guard !n.isEmpty else { return }
+        let m = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        Task { await viewModel.createTag(name: n, message: m.isEmpty ? nil : m) }
+        isPresented = false
     }
 }

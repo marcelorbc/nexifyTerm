@@ -8,6 +8,10 @@ struct TerminalTabsView: View {
     @State private var newPresetName = ""
     @State private var detectedClipboardPath: String?
     @State private var isShowingRemoteExplorer = false
+    @State private var isShowingRecorder = false
+    @State private var pendingTranscriptionURL: URL?
+    @State private var transcriptionMessage: String?
+    @State private var showTranscriptionAlert = false
 
     var body: some View {
         HStack(spacing: 0) {
@@ -37,6 +41,18 @@ struct TerminalTabsView: View {
 
             HStack(spacing: NexTheme.buttonSpacing) {
                 Button {
+                    isShowingRecorder = true
+                } label: {
+                    Image(systemName: "record.circle")
+                        .font(.system(size: NexTheme.iconSizeSmall))
+                        .foregroundColor(.secondary)
+                        .frame(width: NexTheme.hitTargetSmall, height: NexTheme.hitTargetSmall)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Gravar áudio/tela (escolhe pasta no fim)")
+
+                Button {
                     isShowingRemoteExplorer = true
                 } label: {
                     Image(systemName: "globe")
@@ -53,7 +69,27 @@ struct TerminalTabsView: View {
         .frame(height: 38)
         .background(.bar)
         .sheet(isPresented: $isShowingRemoteExplorer) {
-            RemoteExplorerView()
+            RemoteExplorerView(defaultClonePath: appState.activeTab?.currentDirectory)
+        }
+        .sheet(isPresented: $isShowingRecorder) {
+            RecorderPanel(
+                suggestedDirectory: nil,
+                askDestinationAfterRecording: true,
+                onTranscribe: { url in
+                    isShowingRecorder = false
+                    runHeaderTranscription(url: url)
+                },
+                onClose: { isShowingRecorder = false }
+            )
+        }
+        .alert(
+            transcriptionMessage ?? "Transcrição",
+            isPresented: $showTranscriptionAlert,
+            presenting: transcriptionMessage
+        ) { _ in
+            Button("OK", role: .cancel) { transcriptionMessage = nil }
+        } message: { msg in
+            Text(msg)
         }
         .alert("Salvar Layout", isPresented: $showSavePresetAlert) {
             TextField("Nome do layout", text: $newPresetName)
@@ -63,6 +99,32 @@ struct TerminalTabsView: View {
             }
         } message: {
             Text("Escolha um nome para este layout de mosaico.")
+        }
+    }
+
+    private func runHeaderTranscription(url: URL) {
+        let apiKey = ConfigStore.shared.openAIAPIKey
+        guard !apiKey.isEmpty else {
+            transcriptionMessage = "Chave da OpenAI não configurada. Defina em Configurações → IA."
+            showTranscriptionAlert = true
+            return
+        }
+        transcriptionMessage = "Iniciando transcrição de \(url.lastPathComponent)... (pode demorar alguns minutos)"
+        showTranscriptionAlert = true
+        Task {
+            do {
+                let output = try await MediaTranscriptionPipeline.runFullTranscription(for: url) { _ in }
+                await MainActor.run {
+                    transcriptionMessage = "Transcrição salva: \(output.lastPathComponent)"
+                    showTranscriptionAlert = true
+                    NSWorkspace.shared.activateFileViewerSelecting([output])
+                }
+            } catch {
+                await MainActor.run {
+                    transcriptionMessage = "Falha na transcrição: \(error.localizedDescription)"
+                    showTranscriptionAlert = true
+                }
+            }
         }
     }
 
@@ -152,6 +214,11 @@ struct TerminalTabsView: View {
             } label: {
                 Label("Novo Git", systemImage: "arrow.triangle.branch")
             }
+            Button {
+                appState.addDiskAnalyzerTab()
+            } label: {
+                Label("Disk Analyzer", systemImage: "chart.pie.fill")
+            }
 
             Divider()
 
@@ -172,6 +239,11 @@ struct TerminalTabsView: View {
                         appState.addGitTab(directory: path)
                     } label: {
                         Label("Git", systemImage: "arrow.triangle.branch")
+                    }
+                    Button {
+                        appState.addDiskAnalyzerTab(directory: path)
+                    } label: {
+                        Label("Disk Analyzer", systemImage: "chart.pie.fill")
                     }
                 }
 
@@ -202,6 +274,11 @@ struct TerminalTabsView: View {
                                 appState.addGitTab(directory: recent.path)
                             } label: {
                                 Label("Git", systemImage: "arrow.triangle.branch")
+                            }
+                            Button {
+                                appState.addDiskAnalyzerTab(directory: recent.path)
+                            } label: {
+                                Label("Disk Analyzer", systemImage: "chart.pie.fill")
                             }
                         } label: {
                             Label(recent.name, systemImage: "folder")

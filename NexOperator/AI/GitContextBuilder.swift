@@ -20,7 +20,7 @@ struct GitContext {
 
 struct GitContextBuilder {
 
-    static func build(from viewModel: GitViewModel) -> GitContext {
+    @MainActor static func build(from viewModel: GitViewModel) -> GitContext {
         let staged = viewModel.stagedFiles.map { ($0.path, $0.status.rawValue) }
         let unstaged = viewModel.unstagedFiles.map { ($0.path, $0.status.rawValue) }
 
@@ -43,7 +43,7 @@ struct GitContextBuilder {
             recentCommits: recentCommits,
             stashes: stashes,
             diffSummary: "",
-            aheadBehind: nil
+            aheadBehind: viewModel.aheadBehind
         )
     }
 

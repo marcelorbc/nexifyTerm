@@ -156,6 +156,12 @@ class FileItemProvider: ObservableObject {
     private var watcher: DispatchSourceFileSystemObject?
     private var watcherFD: Int32 = -1
     private var pollTimer: Timer?
+    /// Wave 4 · M4: debounce work item for filesystem events. A noisy directory
+    /// (npm install, git checkout, etc.) used to fire several `load()` calls
+    /// within a few milliseconds, each rebuilding the entire `[FileItem]` array
+    /// on the main thread. We coalesce bursts into a single load.
+    private var reloadDebounce: DispatchWorkItem?
+    private static let reloadDebounceInterval: DispatchTimeInterval = .milliseconds(220)
 
     init(url: URL = FileManager.default.homeDirectoryForCurrentUser) {
         self.currentURL = url
@@ -410,7 +416,8 @@ class FileItemProvider: ObservableObject {
             queue: .main
         )
         source.setEventHandler { [weak self] in
-            self?.load()
+            // Coalesce bursts into a single load() — see Wave 4 · M4.
+            self?.scheduleDebouncedReload()
         }
         source.setCancelHandler { [weak self] in
             guard let fd = self?.watcherFD, fd >= 0 else { return }
@@ -444,6 +451,23 @@ class FileItemProvider: ObservableObject {
         watcher = nil
         pollTimer?.invalidate()
         pollTimer = nil
+        reloadDebounce?.cancel()
+        reloadDebounce = nil
+    }
+
+    /// Wave 4 · M4: schedules a single coalesced `load()` for upcoming bursts of
+    /// filesystem events. Existing pending work is cancelled so only the latest
+    /// debounced call survives.
+    private func scheduleDebouncedReload() {
+        reloadDebounce?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.load()
+        }
+        reloadDebounce = item
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.reloadDebounceInterval,
+            execute: item
+        )
     }
 
     deinit {
@@ -451,6 +475,8 @@ class FileItemProvider: ObservableObject {
         watcher = nil
         pollTimer?.invalidate()
         pollTimer = nil
+        reloadDebounce?.cancel()
+        reloadDebounce = nil
         if watcherFD >= 0 {
             close(watcherFD)
             watcherFD = -1

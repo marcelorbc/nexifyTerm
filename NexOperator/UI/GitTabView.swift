@@ -83,16 +83,31 @@ struct GitTabView: View {
         }
         .overlay(alignment: .bottom) {
             if let toast = viewModel.toastMessage {
-                GitToastView(message: toast, isError: viewModel.toastIsError)
+                GitToastView(
+                    message: toast,
+                    isError: viewModel.toastIsError,
+                    onDismiss: viewModel.toastIsError ? { viewModel.dismissToast() } : nil
+                )
                     .transition(.move(edge: .bottom).combined(with: .opacity))
                     .padding(.bottom, showTerminal ? 16 : 16)
-                    .onTapGesture { viewModel.toastMessage = nil }
             }
         }
         .animation(.easeInOut(duration: 0.25), value: viewModel.toastMessage)
         .animation(.easeInOut(duration: 0.2), value: showTerminal)
         .sheet(isPresented: $isShowingRemoteExplorer) {
-            RemoteExplorerView()
+            RemoteExplorerView(defaultClonePath: appState.activeTab?.currentDirectory)
+        }
+        .sheet(isPresented: Binding(
+            get: { viewModel.pendingDestructive != nil },
+            set: { if !$0 { viewModel.cancelPendingDestructive() } }
+        )) {
+            if let action = viewModel.pendingDestructive {
+                GitDestructiveConfirmSheet(
+                    action: action,
+                    onConfirm: { viewModel.confirmPendingDestructive() },
+                    onCancel:  { viewModel.cancelPendingDestructive() }
+                )
+            }
         }
         .alert("Erro Git", isPresented: .constant(viewModel.errorMessage != nil)) {
             Button("OK") { viewModel.errorMessage = nil }
@@ -193,7 +208,7 @@ struct GitTabView: View {
     // MARK: - Toolbar
 
     private var gitToolbar: some View {
-        HStack(spacing: 8) {
+        HStack(spacing: 14) {
             HStack(spacing: 4) {
                 Image(systemName: "arrow.triangle.branch")
                     .font(.system(size: NexTheme.iconSizeSmall))
@@ -201,18 +216,52 @@ struct GitTabView: View {
                 Text(viewModel.currentBranch)
                     .font(.system(size: 12, weight: .semibold))
                     .foregroundColor(NexTheme.textPrimary)
+                aheadBehindBadge
             }
 
             Spacer()
 
-            HStack(spacing: 4) {
-                toolbarButton(icon: "arrow.down.circle", label: "Pull") {
-                    Task { await viewModel.pull() }
+            HStack(spacing: 6) {
+                HStack(spacing: 0) {
+                    gitActionButton(label: "Fetch", icon: "arrow.clockwise") {
+                        Task { await viewModel.fetch() }
+                    }
+                    gitActionButton(label: "Pull", icon: "arrow.down.to.line") {
+                        Task { await viewModel.pull() }
+                    }
+                    pullOptionsMenu
+
+                    gitActionButton(label: "Push", icon: "arrow.up.to.line") {
+                        Task { await viewModel.push() }
+                    }
                 }
-                toolbarButton(icon: "arrow.up.circle", label: "Push") {
-                    Task { await viewModel.push() }
+
+                toolbarGroupDivider
+
+                HStack(spacing: 0) {
+                    gitBranchMenu
+                    mergeRebaseMenu
                 }
-                mergeRebaseMenu
+
+                toolbarGroupDivider
+
+                HStack(spacing: 0) {
+                    gitActionButton(
+                        label: "Stash",
+                        icon: "tray.and.arrow.down",
+                        isEnabled: hasStashableChanges
+                    ) {
+                        Task { await viewModel.stashSave() }
+                    }
+
+                    gitActionButton(
+                        label: "Pop",
+                        icon: "tray.and.arrow.up",
+                        isEnabled: !viewModel.stashes.isEmpty
+                    ) {
+                        Task { await viewModel.stashPop() }
+                    }
+                }
             }
 
             Spacer()
@@ -244,6 +293,166 @@ struct GitTabView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(NexTheme.surface)
+    }
+
+    private var hasStashableChanges: Bool {
+        !viewModel.stagedFiles.isEmpty || !viewModel.unstagedFiles.isEmpty
+    }
+
+    private var pullOptionsMenu: some View {
+        Menu {
+            Button {
+                Task { await viewModel.pull() }
+            } label: {
+                Label("Pull (merge)", systemImage: "arrow.down.to.line")
+            }
+            Button {
+                Task { await viewModel.pullRebase() }
+            } label: {
+                Label("Pull --rebase", systemImage: "arrow.triangle.swap")
+            }
+            Divider()
+            Button {
+                Task { await viewModel.fetch(prune: false) }
+            } label: {
+                Label("Fetch", systemImage: "arrow.clockwise")
+            }
+            Button {
+                Task { await viewModel.fetch(prune: true) }
+            } label: {
+                Label("Fetch + prune", systemImage: "scissors")
+            }
+        } label: {
+            Image(systemName: "chevron.down")
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(NexTheme.textSecondary)
+                .frame(width: 12, height: 44)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Opções de Pull / Fetch")
+    }
+
+    /// Compact "↓N ↑M" pill that lives next to the branch name. Hidden when
+    /// there is no upstream (`hasUpstream == false`) or when both counters
+    /// are zero — keeps the toolbar quiet for a clean repo.
+    @ViewBuilder
+    private var aheadBehindBadge: some View {
+        if viewModel.hasUpstream, let ab = viewModel.aheadBehind, (ab.ahead + ab.behind) > 0 {
+            HStack(spacing: 4) {
+                if ab.behind > 0 {
+                    HStack(spacing: 2) {
+                        Image(systemName: "arrow.down")
+                            .font(.system(size: 8, weight: .bold))
+                        Text("\(ab.behind)")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    }
+                    .foregroundColor(.orange)
+                    .help("\(ab.behind) commit(s) atrás do upstream — considere Pull")
+                }
+                if ab.ahead > 0 {
+                    HStack(spacing: 2) {
+                        Image(systemName: "arrow.up")
+                            .font(.system(size: 8, weight: .bold))
+                        Text("\(ab.ahead)")
+                            .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                    }
+                    .foregroundColor(.green)
+                    .help("\(ab.ahead) commit(s) à frente do upstream — considere Push")
+                }
+            }
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(
+                RoundedRectangle(cornerRadius: 4)
+                    .fill(NexTheme.surface)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(NexTheme.border, lineWidth: 0.5)
+            )
+        } else if !viewModel.hasUpstream && !viewModel.currentBranch.isEmpty {
+            Text("sem upstream")
+                .font(.system(size: 9, weight: .medium))
+                .foregroundColor(NexTheme.textSecondary.opacity(0.8))
+                .padding(.horizontal, 5)
+                .padding(.vertical, 2)
+                .background(
+                    RoundedRectangle(cornerRadius: 4)
+                        .stroke(NexTheme.border.opacity(0.6), lineWidth: 0.5)
+                )
+                .help("Branch local sem tracking — push com -u para configurar")
+        }
+    }
+
+    private var toolbarGroupDivider: some View {
+        Rectangle()
+            .fill(NexTheme.border.opacity(0.6))
+            .frame(width: 1, height: 26)
+            .padding(.horizontal, 2)
+    }
+
+    private var gitBranchMenu: some View {
+        Menu {
+            Section("Branches Locais") {
+                ForEach(viewModel.localBranches) { branch in
+                    Button {
+                        Task { await viewModel.checkoutBranch(branch.name) }
+                    } label: {
+                        Label(
+                            branch.name,
+                            systemImage: branch.isCurrent ? "checkmark.circle.fill" : "arrow.triangle.branch"
+                        )
+                    }
+                }
+            }
+            if !viewModel.remoteBranches.isEmpty {
+                Section("Branches Remotas") {
+                    ForEach(viewModel.remoteBranches) { branch in
+                        Button {
+                            Task { await viewModel.checkoutBranch(branch.name) }
+                        } label: {
+                            Label(branch.name, systemImage: "cloud")
+                        }
+                    }
+                }
+            }
+        } label: {
+            gitActionLabel(label: "Branch", icon: "arrow.triangle.branch", isEnabled: true)
+        }
+        .menuStyle(.button)
+        .buttonStyle(GitToolbarButtonStyle(isEnabled: true))
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .help("Trocar de branch")
+    }
+
+    private func gitActionButton(
+        label: String,
+        icon: String,
+        isEnabled: Bool = true,
+        action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            gitActionLabel(label: label, icon: icon, isEnabled: isEnabled)
+        }
+        .buttonStyle(GitToolbarButtonStyle(isEnabled: isEnabled))
+        .disabled(!isEnabled)
+        .help(label)
+    }
+
+    private func gitActionLabel(label: String, icon: String, isEnabled: Bool) -> some View {
+        VStack(spacing: 3) {
+            Image(systemName: icon)
+                .font(.system(size: 15, weight: .regular))
+            Text(label)
+                .font(.system(size: 10, weight: .medium))
+        }
+        .foregroundColor(isEnabled ? NexTheme.textPrimary : NexTheme.textSecondary.opacity(0.5))
+        .frame(width: 52, height: 44)
+        .contentShape(Rectangle())
     }
 
     private var mergeRebaseMenu: some View {
@@ -292,19 +501,11 @@ struct GitTabView: View {
                 Label("Abortar Rebase", systemImage: "xmark.octagon")
             }
         } label: {
-            HStack(spacing: 3) {
-                Image(systemName: "arrow.triangle.merge")
-                    .font(.system(size: NexTheme.iconSizeSmall))
-                Text("Merge / Rebase")
-                    .font(.system(size: 11))
-            }
-            .foregroundColor(NexTheme.textSecondary)
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .background(NexTheme.surfaceHover)
-            .cornerRadius(5)
+            gitActionLabel(label: "Merge", icon: "arrow.triangle.merge", isEnabled: true)
         }
-        .menuStyle(.borderlessButton)
+        .menuStyle(.button)
+        .buttonStyle(GitToolbarButtonStyle(isEnabled: true))
+        .menuIndicator(.hidden)
         .fixedSize()
         .help("Merge ou Rebase de branches")
     }
@@ -461,13 +662,50 @@ struct GitTabView: View {
             Text(viewModel.repoPath)
                 .font(.system(size: 11))
                 .foregroundColor(NexTheme.textSecondary.opacity(0.7))
-            Button("Inicializar git init") {
-                // TODO: Phase 4 - git init support
+                .textSelection(.enabled)
+            HStack(spacing: 8) {
+                Button {
+                    Task { await viewModel.initRepo(initialBranch: "main") }
+                } label: {
+                    Label("Inicializar (git init)", systemImage: "plus.circle")
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .disabled(viewModel.isLoading)
+
+                Button {
+                    isShowingRemoteExplorer = true
+                } label: {
+                    Label("Clonar repositório…", systemImage: "globe")
+                }
+                .controlSize(.small)
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
+            if viewModel.isLoading {
+                ProgressView().controlSize(.small)
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+// MARK: - Git Toolbar Button Style
+
+private struct GitToolbarButtonStyle: ButtonStyle {
+    let isEnabled: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .background(
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(
+                        configuration.isPressed && isEnabled
+                            ? NexTheme.surfaceHover
+                            : Color.clear
+                    )
+            )
+            .contentShape(Rectangle())
+            .opacity(configuration.isPressed && isEnabled ? 0.85 : 1.0)
+            .animation(.easeOut(duration: 0.08), value: configuration.isPressed)
     }
 }
 
@@ -476,18 +714,67 @@ struct GitTabView: View {
 struct GitToastView: View {
     let message: String
     let isError: Bool
+    /// Optional. Shown only on error toasts so the user can dismiss long
+    /// messages explicitly. Sucesso continua auto-dismissing.
+    var onDismiss: (() -> Void)? = nil
+
+    @State private var didCopy = false
 
     var body: some View {
-        HStack(spacing: 8) {
+        HStack(alignment: .top, spacing: 8) {
             Image(systemName: isError ? "xmark.circle.fill" : "checkmark.circle.fill")
                 .font(.system(size: 14))
                 .foregroundColor(isError ? .red : .green)
+                .padding(.top, 1)
+
             Text(message)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundColor(NexTheme.textPrimary)
-                .lineLimit(2)
+                .lineLimit(isError ? 8 : 2)
+                .textSelection(.enabled)
+                .frame(maxWidth: 520, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if isError {
+                Button {
+                    copyMessage()
+                } label: {
+                    HStack(spacing: 3) {
+                        Image(systemName: didCopy ? "checkmark" : "doc.on.doc")
+                            .font(.system(size: 10, weight: .semibold))
+                        Text(didCopy ? "Copiado" : "Copiar")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .foregroundColor(didCopy ? .green : NexTheme.accent)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(
+                        RoundedRectangle(cornerRadius: 5)
+                            .fill((didCopy ? Color.green : NexTheme.accent).opacity(0.12))
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 5)
+                            .stroke((didCopy ? Color.green : NexTheme.accent).opacity(0.4), lineWidth: 0.5)
+                    )
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Copiar erro completo para a área de transferência")
+
+                if let onDismiss {
+                    Button(action: onDismiss) {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .bold))
+                            .foregroundColor(NexTheme.textSecondary)
+                            .frame(width: 22, height: 22)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Fechar")
+                }
+            }
         }
-        .padding(.horizontal, 16)
+        .padding(.horizontal, 14)
         .padding(.vertical, 10)
         .background(
             RoundedRectangle(cornerRadius: 8)
@@ -498,5 +785,20 @@ struct GitToastView: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(isError ? Color.red.opacity(0.3) : Color.green.opacity(0.3), lineWidth: 1)
         )
+        .onTapGesture {
+            // Click anywhere on an error toast also copies — fastest path
+            // for "manda esse erro pra mim".
+            if isError { copyMessage() }
+        }
+    }
+
+    private func copyMessage() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(message, forType: .string)
+        didCopy = true
+        Task {
+            try? await Task.sleep(nanoseconds: 1_500_000_000)
+            didCopy = false
+        }
     }
 }

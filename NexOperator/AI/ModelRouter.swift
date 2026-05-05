@@ -31,7 +31,7 @@ struct ModelRouter {
 
     func generatePlanStreaming(input: AgentInput, onChunk: @escaping StreamCallback) async throws -> AgentPlan {
         let llm = provider(for: input.provider, model: input.model)
-        NexLog.ai.info("Routing streaming to \(llm.displayName) (\(input.model)) [mode: \(input.tabMode)]")
+        NexLog.ai.info("Routing streaming to \(llm.displayName) (\(input.model)) [mode: \(input.tabMode.rawValue)]")
 
         let messages = PromptBuilder.buildMessages(from: input, tabMode: input.tabMode, contextExtra: input.contextExtra)
         let content = try await llm.sendRawStreaming(messages: messages, onChunk: onChunk)

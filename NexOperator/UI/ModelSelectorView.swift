@@ -8,9 +8,15 @@ struct ModelSelectorView: View {
     }
 
     var body: some View {
+        let availability = ProviderAvailabilityService.shared
+        let providers = availability.availableProviders.isEmpty
+            ? ProviderType.allCases
+            : availability.availableProviders
+        let models = availability.availableModels(for: tab.provider)
+
         HStack(spacing: 8) {
             Picker("", selection: $tab.provider) {
-                ForEach(ProviderType.allCases) { provider in
+                ForEach(providers) { provider in
                     Text(provider.displayName).tag(provider)
                 }
             }
@@ -18,11 +24,12 @@ struct ModelSelectorView: View {
             .frame(width: 90)
             .controlSize(.small)
             .onChange(of: tab.provider) { _, newProvider in
-                tab.model = newProvider.defaultModel
+                let newModels = availability.availableModels(for: newProvider)
+                tab.model = newModels.first ?? newProvider.defaultModel
             }
 
             Picker("", selection: $tab.model) {
-                ForEach(tab.provider.availableModels, id: \.self) { model in
+                ForEach(models, id: \.self) { model in
                     let caps = ProviderType.capabilities(for: model)
                     Label(model, systemImage: caps.tier.icon)
                         .tag(model)

@@ -115,10 +115,13 @@ struct AgentPlan: Codable {
     let skillCreation: SkillCreation?
     let gitActions: [GitAction]?
     let fileActions: [FileAction]?
+    /// Optional memory updates emitted by the LLM (auto-capture). Processed by the
+    /// agent executor against `MemoryStore.shared` when the user has memory auto-capture enabled.
+    let memoryUpdates: [MemoryUpdate]?
 
     enum CodingKeys: String, CodingKey {
         case title, explanation, commands, finalNote, richOutput, mcpToolCalls, skillCreation
-        case gitActions, fileActions
+        case gitActions, fileActions, memoryUpdates
     }
 
     init(from decoder: Decoder) throws {
@@ -132,6 +135,7 @@ struct AgentPlan: Codable {
         skillCreation = try? container.decodeIfPresent(SkillCreation.self, forKey: .skillCreation)
         gitActions = try? container.decodeIfPresent([GitAction].self, forKey: .gitActions)
         fileActions = try? container.decodeIfPresent([FileAction].self, forKey: .fileActions)
+        memoryUpdates = try? container.decodeIfPresent([MemoryUpdate].self, forKey: .memoryUpdates)
     }
 
     var maxRiskLevel: RiskLevel {
@@ -161,6 +165,11 @@ struct AgentPlan: Codable {
         return !actions.isEmpty
     }
 
+    var hasMemoryUpdates: Bool {
+        guard let updates = memoryUpdates else { return false }
+        return !updates.isEmpty
+    }
+
     var hasNoWork: Bool {
         commands.isEmpty && !hasGitActions && !hasFileActions
     }
@@ -175,7 +184,7 @@ struct AgentPlan: Codable {
         )
     }
 
-    init(title: String, explanation: String, commands: [AgentCommand] = [], finalNote: String = "", richOutput: RichOutput? = nil, mcpToolCalls: [MCPToolCall]? = nil, skillCreation: SkillCreation? = nil, gitActions: [GitAction]? = nil, fileActions: [FileAction]? = nil) {
+    init(title: String, explanation: String, commands: [AgentCommand] = [], finalNote: String = "", richOutput: RichOutput? = nil, mcpToolCalls: [MCPToolCall]? = nil, skillCreation: SkillCreation? = nil, gitActions: [GitAction]? = nil, fileActions: [FileAction]? = nil, memoryUpdates: [MemoryUpdate]? = nil) {
         self.title = title
         self.explanation = explanation
         self.commands = commands
@@ -185,5 +194,6 @@ struct AgentPlan: Codable {
         self.skillCreation = skillCreation
         self.gitActions = gitActions
         self.fileActions = fileActions
+        self.memoryUpdates = memoryUpdates
     }
 }

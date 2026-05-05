@@ -14,6 +14,12 @@ struct MosaicPaneView: View {
 
     @State private var isHeaderHovered = false
 
+    /// Wave 6 · A9: this pane is "focused" (i.e. the agent will route commands
+    /// here). Visualised by an accent border + a dot in the header.
+    private var isFocused: Bool {
+        appState.focusedPane(in: tabId) == paneId
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             paneHeader
@@ -26,14 +32,32 @@ struct MosaicPaneView: View {
         .background(NexTheme.bg)
         .overlay(
             RoundedRectangle(cornerRadius: 0)
-                .stroke(NexTheme.border.opacity(0.4), lineWidth: 0.5)
+                .stroke(
+                    isFocused ? Color.accentColor.opacity(0.85) : NexTheme.border.opacity(0.4),
+                    lineWidth: isFocused ? 1.5 : 0.5
+                )
         )
+        // Wave 6 · A9: capture taps anywhere inside the pane to claim focus,
+        // but use `simultaneousGesture` so the tap still reaches the terminal
+        // (NSView underneath needs the click to gain keyboard focus).
+        .simultaneousGesture(
+            TapGesture().onEnded { _ in
+                appState.setFocusedPane(paneId, in: tabId)
+            }
+        )
+        .animation(.easeInOut(duration: 0.15), value: isFocused)
     }
 
     // MARK: - Header
 
     private var paneHeader: some View {
         HStack(spacing: 4) {
+            // Wave 6 · A9: dot indicator. Solid accent when focused so it's
+            // unambiguous which pane the agent will target.
+            Circle()
+                .fill(isFocused ? Color.accentColor : NexTheme.textSecondary.opacity(0.25))
+                .frame(width: 6, height: 6)
+
             Image(systemName: content.icon)
                 .font(.system(size: 9))
                 .foregroundColor(.accentColor)
@@ -52,6 +76,7 @@ struct MosaicPaneView: View {
         }
         .padding(.horizontal, 8)
         .frame(height: 28)
+        .background(isFocused ? Color.accentColor.opacity(0.08) : Color.clear)
         .background(.bar)
         .onHover { isHeaderHovered = $0 }
         .animation(.easeInOut(duration: 0.15), value: isHeaderHovered)

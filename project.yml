@@ -10,6 +10,9 @@ packages:
   SwiftTerm:
     url: https://github.com/migueldeicaza/SwiftTerm
     from: "1.0.0"
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    from: "2.0.0"
 
 targets:
   NexifyTermWidget:
@@ -20,8 +23,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nexia.nexifyterm.widget
         PRODUCT_NAME: NexifyTermWidget
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.1.6"
+        CURRENT_PROJECT_VERSION: "6"
         SWIFT_VERSION: "5"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
@@ -36,13 +39,14 @@ targets:
     sources: [NexOperator]
     dependencies:
       - package: SwiftTerm
+      - package: Sparkle
       - target: NexifyTermWidget
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nexia.nexifyterm
         PRODUCT_NAME: NexifyTerm
-        MARKETING_VERSION: "0.1.0"
-        CURRENT_PROJECT_VERSION: "1"
+        MARKETING_VERSION: "0.1.6"
+        CURRENT_PROJECT_VERSION: "6"
         SWIFT_VERSION: "5"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
@@ -71,12 +75,17 @@ targets:
         LSMinimumSystemVersion: "$(MACOSX_DEPLOYMENT_TARGET)"
         NSPrincipalClass: NSApplication
         NSAppleEventsUsageDescription: "NexOperator precisa controlar outros aplicativos para automação do sistema."
+        NSMicrophoneUsageDescription: "NexifyTerm precisa do microfone para gravar áudio que você opte por capturar."
+        NSCameraUsageDescription: "NexifyTerm pode precisar acessar a câmera para captura de tela em algumas configurações."
         NSContactsUsageDescription: "NexOperator pode precisar acessar contatos para operações do sistema."
         NSCalendarsUsageDescription: "NexOperator pode precisar acessar calendários para operações do sistema."
         NSLocationUsageDescription: "NexOperator pode precisar da localização para configurações de rede e sistema."
         NSPhotoLibraryUsageDescription: "NexOperator pode precisar acessar fotos para operações do sistema."
         NSBluetoothAlwaysUsageDescription: "NexOperator pode precisar do Bluetooth para diagnósticos de dispositivos."
         NSSystemAdministrationUsageDescription: "NexOperator precisa de privilégios administrativos para gerenciar configurações do sistema."
+        SUFeedURL: "https://nexify.ink/downloads/appcast.xml"
+        SUPublicEDKey: "Wmi2NH93JmwEeKPlQgjnqcTKnoFvHfCiEYDvvUS7WeM="
+        SUEnableAutomaticChecks: true
         NSServices:
           - NSMessage: openInNexifyTerm
             NSMenuItem:
@@ -96,9 +105,14 @@ targets:
         com.apple.security.automation.apple-events: true
         com.apple.security.device.usb: true
         com.apple.security.device.bluetooth: true
+        com.apple.security.device.audio-input: true
+        com.apple.security.device.camera: true
+        com.apple.security.device.microphone: true
         com.apple.security.personal-information.addressbook: true
         com.apple.security.personal-information.calendars: true
         com.apple.security.personal-information.location: true
         com.apple.security.personal-information.photos-library: true
         com.apple.security.application-groups:
           - group.com.nexia.nexifyterm
+        com.apple.security.cs.disable-library-validation: true
+        com.apple.security.cs.allow-dyld-environment-variables: true

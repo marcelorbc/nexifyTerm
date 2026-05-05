@@ -1,6 +1,7 @@
 import AppKit
 import ServiceManagement
 import CoreSpotlight
+import Sparkle
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
@@ -161,10 +162,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for (index, tab) in state.tabs.enumerated() {
             let icon: String
             switch tab.tabMode {
-            case .terminal: icon = "⌨"
-            case .explorer: icon = "📁"
-            case .mosaic:   icon = "◫"
-            case .git:      icon = "⎇"
+            case .terminal:     icon = "⌨"
+            case .explorer:     icon = "📁"
+            case .mosaic:       icon = "◫"
+            case .git:          icon = "⎇"
+            case .diskAnalyzer: icon = "💿"
             }
 
             let prefix = tab.id == state.activeTabId ? "● " : "  "
@@ -266,6 +268,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem(title: "Abrir NexOperator", action: #selector(showMainWindow), keyEquivalent: "o"))
         menu.addItem(.separator())
 
+        let updateItem = NSMenuItem(title: "Verificar Atualizações…", action: #selector(checkForUpdates), keyEquivalent: "u")
+        updateItem.target = self
+        menu.addItem(updateItem)
+
         let launchItem = NSMenuItem(title: "Abrir com o sistema", action: #selector(toggleLaunchAtLogin), keyEquivalent: "")
         launchItem.state = Self.launchAtLoginEnabled ? .on : .off
         launchItem.tag = 100
@@ -285,6 +291,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.makeKeyAndOrderFront(nil)
         } else if let window = NSApp.windows.first {
             window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    @objc private func checkForUpdates() {
+        Task { @MainActor in
+            UpdaterService.shared.checkForUpdates()
         }
     }
 

@@ -22,8 +22,19 @@ class AppState: ObservableObject {
 
     @Published var tabStateVersion = 0
 
+    /// Plano dry-run aguardando aprovação do usuário (Phase 1 · Trust).
+    @Published var pendingDryRunPlan: ExecutionPlan?
+    @Published var isShowingDryRunPreview = false
+    /// Continuation que destrava o agent quando o usuário decide.
+    var dryRunDecisionContinuation: CheckedContinuation<DryRunDecision, Never>?
+
     private var tabAgentStates: [UUID: TabAgentState] = [:]
     private var gitViewModels: [UUID: GitViewModel] = [:]
+    /// Wave 6 · A9: tracks which mosaic pane is currently in focus per tab.
+    /// The key is `tab.id`, the value is `paneId`. When the user taps inside a
+    /// pane the agent (and any future per-pane action) will route to that pane
+    /// instead of falling back to the tab-wide session.
+    @Published private(set) var focusedMosaicPaneIds: [UUID: UUID] = [:]
     private let historyStore = HistoryStore.shared
 
     let configStore = ConfigStore.shared
@@ -39,6 +50,37 @@ class AppState: ObservableObject {
             addExplorerTab(directory: FileManager.default.homeDirectoryForCurrentUser.path)
         }
         startMCPServers()
+        warmSystemProfile()
+        refreshProviderAvailability()
+        if !history.isEmpty {
+            HistoryAnalyzer.shared.scheduleAnalysis(entries: history, delay: 5.0)
+        }
+    }
+
+    func refreshProviderAvailability() {
+        Task { @MainActor in
+            await ProviderAvailabilityService.shared.refresh()
+            let avail = ProviderAvailabilityService.shared
+            if avail.hasChecked,
+               let best = avail.bestAvailableProvider(),
+               !avail.availableProviders.contains(configStore.defaultProvider) {
+                configStore.defaultProvider = best
+                for i in tabs.indices {
+                    tabs[i].provider = best
+                    let models = avail.availableModels(for: best)
+                    tabs[i].model = models.first ?? best.defaultModel
+                }
+                notifyTabStateChanged()
+            }
+        }
+    }
+
+    /// Kicks off (in the background) the collection of hardware/OS/installed
+    /// software so the next agent prompt already has it. Refresh runs only when
+    /// the cache is missing or older than `staleAfter` (3 days).
+    private func warmSystemProfile() {
+        guard configStore.systemProfileEnabled else { return }
+        SystemProfileService.shared.refresh()
     }
 
     private func startMCPServers() {
@@ -53,13 +95,18 @@ class AppState: ObservableObject {
     // MARK: - Session Persistence
 
     func saveSession() {
-        let savedTabs = tabs.compactMap { tab -> SavedTab? in
-            guard tab.tabMode != .mosaic else { return nil }
-            return SavedTab(from: tab)
-        }
+        // Wave 5 · A8: mosaic layouts now round-trip via Codable on `MosaicNode`,
+        // so we no longer drop them on save.
+        let savedTabs = tabs.map { SavedTab(from: $0) }
         guard !savedTabs.isEmpty else { return }
         let activeIndex = tabs.firstIndex(where: { $0.id == activeTabId })
-        NexPersistence.shared.saveTabs(savedTabs, activeTabIndex: activeIndex)
+        // Wave 3 · A7: persist activeTabId so the right tab is restored even when
+        // some tabs are filtered out during restore (e.g., deleted directory).
+        NexPersistence.shared.saveTabs(
+            savedTabs,
+            activeTabIndex: activeIndex,
+            activeTabId: activeTabId
+        )
     }
 
     @discardableResult
@@ -76,9 +123,19 @@ class AppState: ObservableObject {
         for saved in validTabs {
             let tab = saved.toTerminalTab()
             tabs.append(tab)
+            // Wave 6 · A9: seed mosaic focus from the restored layout so the
+            // user lands with a focused pane (matches addMosaicTab behaviour).
+            if let layout = tab.mosaicLayout, let first = layout.allPaneIds.first {
+                focusedMosaicPaneIds[tab.id] = first
+            }
         }
 
-        if let idx = session.activeTabIndex, idx >= 0, idx < tabs.count {
+        // Wave 3 · A7: prefer activeTabId (resilient to filtering); only fall
+        // back to the saved index for sessions written by older builds.
+        if let savedActive = session.activeTabId,
+           tabs.contains(where: { $0.id == savedActive }) {
+            activeTabId = savedActive
+        } else if let idx = session.activeTabIndex, idx >= 0, idx < tabs.count {
             activeTabId = tabs[idx].id
         } else {
             activeTabId = tabs.first?.id
@@ -89,6 +146,13 @@ class AppState: ObservableObject {
     private func appendHistory(_ entry: HistoryEntry) {
         history.append(entry)
         historyStore.save(history)
+        // Auto-analyze (debounced) so the personalization panel always shows
+        // up-to-date insights without blocking the active conversation.
+        HistoryAnalyzer.shared.scheduleAnalysis(entries: history)
+        // Auto-title the conversation (ChatGPT-style) for the originating tab.
+        if let tabId = entry.tabId, entry.type == .agentPlan {
+            ConversationTitler.shared.updateTitleIfNeeded(for: tabId, entries: history)
+        }
     }
 
     var modelRouter: ModelRouter {
@@ -102,6 +166,13 @@ class AppState: ObservableObject {
         let state = TabAgentState()
         tabAgentStates[tabId] = state
         return state
+    }
+
+    /// Clears the conversation memory for the active tab. Use this when the user
+    /// wants a fresh start without past turns biasing the LLM.
+    func clearActiveTabConversation() {
+        activeAgentState?.clearConversation()
+        notifyTabStateChanged()
     }
 
     var activeAgentState: TabAgentState? {
@@ -205,6 +276,9 @@ class AppState: ObservableObject {
         tabs.append(tab)
         activeTabId = tab.id
         RecentDirectoriesStore.shared.add(directory)
+        // Wave 3 · A2: parity with addExplorerTab/addGitTab/addMosaicTab — keep
+        // sidebar/topbar/widget consistent the moment a new terminal tab opens.
+        notifyTabStateChanged()
     }
 
     func addExplorerTab(directory: String? = nil) {
@@ -240,10 +314,85 @@ class AppState: ObservableObject {
         notifyTabStateChanged()
     }
 
+    func addDiskAnalyzerTab(directory: String? = nil) {
+        let dir = directory ?? configStore.defaultDirectory
+        let folderName = URL(fileURLWithPath: dir).lastPathComponent
+        let tab = TerminalTab(
+            title: "Disco: \(folderName)",
+            currentDirectory: dir,
+            provider: configStore.defaultProvider,
+            model: configStore.modelForProvider(configStore.defaultProvider),
+            approvalMode: configStore.defaultApprovalMode,
+            tabMode: .diskAnalyzer
+        )
+        tabs.append(tab)
+        activeTabId = tab.id
+        RecentDirectoriesStore.shared.add(dir)
+        notifyTabStateChanged()
+    }
+
+    // MARK: - Mosaic focus (Wave 6 · A9)
+
+    /// Sets the focused pane for a mosaic tab. Called by `MosaicPaneView` on tap
+    /// or when a pane gets a primary interaction. Triggers a state notification
+    /// so the focus ring updates everywhere.
+    func setFocusedPane(_ paneId: UUID, in tabId: UUID) {
+        guard focusedMosaicPaneIds[tabId] != paneId else { return }
+        focusedMosaicPaneIds[tabId] = paneId
+        notifyTabStateChanged()
+    }
+
+    /// Returns the currently-focused pane for the given mosaic tab, or `nil` if
+    /// none is set yet (caller should pick a sensible default — usually the
+    /// first pane in the layout).
+    func focusedPane(in tabId: UUID) -> UUID? {
+        focusedMosaicPaneIds[tabId]
+    }
+
+    /// Resolves the terminal session that the agent (or other code) should
+    /// target for the given tab. For non-mosaic tabs this is just the tab's own
+    /// session. For mosaic tabs we look up the focused pane's content; if it
+    /// resolves to a `.terminal` we use that pane's `sessionId`. Otherwise we
+    /// fall back to the tab session so the agent still has somewhere to echo.
+    func effectiveSessionId(for tab: TerminalTab) -> UUID {
+        guard tab.tabMode == .mosaic, let layout = tab.mosaicLayout else {
+            return tab.id
+        }
+        let candidate = focusedMosaicPaneIds[tab.id] ?? layout.allPaneIds.first
+        guard let paneId = candidate,
+              let content = Self.findPaneContent(paneId, in: layout) else {
+            return tab.id
+        }
+        if case .terminal(let sessionId) = content {
+            return sessionId
+        }
+        // Pane is an explorer — there's no PTY to echo into, so reuse the tab
+        // session (which `AgentExecutor`'s `echoAgentCommand` will spawn lazily
+        // if needed).
+        return tab.id
+    }
+
+    private static func findPaneContent(_ paneId: UUID, in node: MosaicNode) -> PaneContent? {
+        switch node {
+        case .pane(let id, let content):
+            return id == paneId ? content : nil
+        case .split(_, _, _, let first, let second):
+            return findPaneContent(paneId, in: first) ?? findPaneContent(paneId, in: second)
+        }
+    }
+
     func gitViewModel(for tabId: UUID) -> GitViewModel {
-        if let existing = gitViewModels[tabId] { return existing }
         let dir = tabs.first(where: { $0.id == tabId })?.currentDirectory
             ?? configStore.defaultDirectory
+        if let existing = gitViewModels[tabId] {
+            // Wave 1 · C2: if the tab navigated to another directory, the same
+            // GitViewModel instance must follow it. Otherwise the panel keeps
+            // showing data from the original repo path.
+            if existing.repoPath != dir {
+                Task { await existing.relocate(to: dir) }
+            }
+            return existing
+        }
         let vm = GitViewModel(repoPath: dir)
         gitViewModels[tabId] = vm
         return vm
@@ -261,6 +410,11 @@ class AppState: ObservableObject {
         )
         tabs.append(tab)
         activeTabId = tab.id
+        // Wave 6 · A9: seed the focus to the first pane so the agent and the
+        // visual indicator have a sensible default before the user clicks.
+        if let firstPane = layout.allPaneIds.first {
+            focusedMosaicPaneIds[tab.id] = firstPane
+        }
         notifyTabStateChanged()
     }
 
@@ -273,12 +427,27 @@ class AppState: ObservableObject {
             sessionManager.destroySession(for: sessionId)
         }
         tabs[index].mosaicLayout = layout
+
+        // Wave 6 · A9: if the focused pane is no longer in the layout (was
+        // closed), clear the focus so a stale paneId isn't kept around.
+        if let focused = focusedMosaicPaneIds[tabId],
+           !layout.allPaneIds.contains(focused) {
+            focusedMosaicPaneIds[tabId] = layout.allPaneIds.first
+        }
+
         notifyTabStateChanged()
     }
 
     func closeTab(_ id: UUID, force: Bool = false) {
         guard let tab = tabs.first(where: { $0.id == id }) else { return }
         if tab.isPinned && !force { return }
+
+        // Wave 3 · A1: capture neighbour BEFORE removing so we can land the user
+        // on the visually-adjacent tab instead of jumping to the very end of the
+        // bar. Prefer the tab to the right (`closedIndex` after removal); if it
+        // was the rightmost, fall back to the new last tab.
+        let closedIndex = tabs.firstIndex(where: { $0.id == id }) ?? -1
+        let wasActive = activeTabId == id
 
         if let layout = tab.mosaicLayout {
             for sessionId in layout.allTerminalSessionIds {
@@ -288,10 +457,19 @@ class AppState: ObservableObject {
         tabAgentStates[id]?.cancel()
         tabAgentStates.removeValue(forKey: id)
         gitViewModels.removeValue(forKey: id)
+        focusedMosaicPaneIds.removeValue(forKey: id)
         sessionManager.destroySession(for: id)
         tabs.removeAll { $0.id == id }
-        if activeTabId == id {
-            activeTabId = tabs.last?.id
+        if wasActive {
+            if tabs.isEmpty {
+                activeTabId = nil
+            } else if closedIndex >= 0, closedIndex < tabs.count {
+                // After removal, the index that was occupied by `id` now holds
+                // the next-to-the-right tab — that's the natural successor.
+                activeTabId = tabs[closedIndex].id
+            } else {
+                activeTabId = tabs.last?.id
+            }
         }
         if tabs.isEmpty {
             addTab()
@@ -370,15 +548,21 @@ class AppState: ObservableObject {
     // MARK: - Terminal Command
 
     func sendTerminalCommand(_ command: String) {
-        guard let tabId = activeTabId else { return }
-        let session = sessionManager.session(for: tabId)
+        guard let tabId = activeTabId,
+              let tab = tabs.first(where: { $0.id == tabId }) else { return }
+        // Wave 6 · A9: in mosaic mode, route to the focused pane's session so
+        // the user types into the visible terminal, not into a hidden one.
+        let targetSessionId = effectiveSessionId(for: tab)
+        let session = sessionManager.session(for: targetSessionId, initialDirectory: tab.currentDirectory)
         SessionLogger.shared.logTerminalCommand(command)
         session.sendCommand(command)
 
         let entry = HistoryEntry(
             type: .terminalCommand,
             userInput: command,
-            commands: [command]
+            commands: [command],
+            tabId: tabId,
+            tabTitle: tab.title
         )
         appendHistory(entry)
     }
@@ -392,7 +576,10 @@ class AppState: ObservableObject {
             let ctx = GitContextBuilder.build(from: vm)
             return GitContextBuilder.formatForPrompt(ctx)
         case .explorer:
-            return ""
+            // Wave 5 · B1: feed the LLM a real directory snapshot instead of an
+            // empty string when the user is operating in explorer mode.
+            let ctx = ExplorerContextBuilder.build(directory: tab.currentDirectory)
+            return ExplorerContextBuilder.formatForPrompt(ctx)
         default:
             return ""
         }
@@ -420,7 +607,9 @@ class AppState: ObservableObject {
 
     func showPlanPreview(_ userMessage: String, tab: TerminalTab) {
         let state = agentState(for: tab.id)
-        let session = sessionManager.session(for: tab.id)
+        // Wave 6 · A9: route to the focused mosaic pane's session if applicable.
+        let targetSessionId = effectiveSessionId(for: tab)
+        let session = sessionManager.session(for: targetSessionId, initialDirectory: tab.currentDirectory)
 
         state.isAgentRunning = true
         state.agentStatus = "Gerando plano..."
@@ -444,7 +633,8 @@ class AppState: ObservableObject {
             mcpToolsContext: mcpCtx,
             fileAttachments: state.fileAttachments,
             tabMode: tab.tabMode,
-            contextExtra: contextExtra
+            contextExtra: contextExtra,
+            conversationTurns: state.recentTurnsForPrompt
         )
 
         let router = modelRouter
@@ -472,8 +662,27 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Wave 1 · C1: locates the tab whose preview is currently being shown to the
+    /// user. We prefer the active tab (the user almost always operates on what
+    /// they see), but fall back to *any* tab that still has a pending preview —
+    /// this prevents accidentally approving/dismissing a preview against the
+    /// wrong tab if state shifted between rendering and the button tap.
+    private func tabWithPendingPreview() -> TerminalTab? {
+        if let active = activeTab,
+           let activeState = tabAgentStates[active.id],
+           activeState.isShowingPlanPreview {
+            return active
+        }
+        for tab in tabs {
+            if let state = tabAgentStates[tab.id], state.isShowingPlanPreview {
+                return tab
+            }
+        }
+        return nil
+    }
+
     func approvePlanPreview() {
-        guard let tab = activeTab else { return }
+        guard let tab = tabWithPendingPreview() else { return }
         let state = agentState(for: tab.id)
         guard let msg = state.pendingAgentMessage else { return }
         state.dismissPlanPreview()
@@ -482,12 +691,20 @@ class AppState: ObservableObject {
     }
 
     func dismissPlanPreview() {
-        activeAgentState?.dismissPlanPreview()
+        guard let tab = tabWithPendingPreview() else {
+            activeAgentState?.dismissPlanPreview()
+            notifyTabStateChanged()
+            return
+        }
+        agentState(for: tab.id).dismissPlanPreview()
         notifyTabStateChanged()
     }
 
     func previewGuardResultsList() -> [CommandGuard.GuardResult] {
-        activeAgentState?.previewGuardResults ?? []
+        if let tab = tabWithPendingPreview() {
+            return agentState(for: tab.id).previewGuardResults
+        }
+        return activeAgentState?.previewGuardResults ?? []
     }
 
     func executeAgent(_ userMessage: String, tab: TerminalTab) {
@@ -507,6 +724,7 @@ class AppState: ObservableObject {
         let executor = AgentExecutor(router: modelRouter)
         executor.fileAttachments = state.fileAttachments
         executor.contextExtra = buildContextExtra(for: tab)
+        executor.priorTurns = state.recentTurnsForPrompt
         if tab.tabMode == .git {
             executor.gitViewModel = gitViewModel(for: tab.id)
         }
@@ -522,7 +740,14 @@ class AppState: ObservableObject {
             state.streamingText = partial
             self?.notifyTabStateChanged()
         }
-        let session = sessionManager.session(for: tab.id)
+        executor.onDryRunRequest = { [weak self] plan in
+            guard let self else { return .approve }
+            return await self.requestDryRunApproval(plan: plan)
+        }
+        // Wave 6 · A9: target the focused pane's session so agent output ends
+        // up in the terminal the user is actually looking at.
+        let targetSessionId = effectiveSessionId(for: tab)
+        let session = sessionManager.session(for: targetSessionId, initialDirectory: tab.currentDirectory)
 
         state.agentTask = Task { [weak self] in
             executor.execute(
@@ -551,10 +776,28 @@ class AppState: ObservableObject {
                     state.isAgentRunning = false
                     state.endTime = Date()
                     state.lastRichOutput = richOutput
+
+                    // IMPORTANT: snapshot the plan BEFORE clearing it, otherwise the
+                    // ConversationTurn we build for the tab memory has empty title /
+                    // explanation and the next user message loses context.
+                    let completedPlan = state.runningPlan
                     state.runningPlan = nil
+
                     if let urlStr = richOutput?.openUrl, let url = URL(string: urlStr) {
                         state.browserURL = url
                     }
+
+                    let succeeded = state.agentResults.allSatisfy { $0.output.succeeded || $0.wasBlocked }
+                    let turn = ConversationTurn.from(
+                        userMessage: userMessage,
+                        plan: completedPlan,
+                        results: state.agentResults,
+                        summary: summary,
+                        richOutput: richOutput,
+                        succeeded: succeeded
+                    )
+                    state.appendTurn(turn)
+
                     self?.notifyTabStateChanged()
 
                     let cmds = state.agentResults.map(\.command)
@@ -572,7 +815,9 @@ class AppState: ObservableObject {
                         userInput: userMessage,
                         commands: cmds,
                         summary: summary,
-                        stepOutputs: outputs
+                        stepOutputs: outputs,
+                        tabId: tab.id,
+                        tabTitle: tab.title
                     )
                     self?.appendHistory(entry)
                 },
@@ -581,7 +826,20 @@ class AppState: ObservableObject {
                     state.agentStatus = nil
                     state.isAgentRunning = false
                     state.endTime = Date()
+
+                    let failedPlan = state.runningPlan
                     state.runningPlan = nil
+
+                    let turn = ConversationTurn.from(
+                        userMessage: userMessage,
+                        plan: failedPlan,
+                        results: state.agentResults,
+                        summary: "Erro: \(error)",
+                        richOutput: nil,
+                        succeeded: false
+                    )
+                    state.appendTurn(turn)
+
                     self?.notifyTabStateChanged()
 
                     let cmds = state.agentResults.map(\.command)
@@ -599,13 +857,22 @@ class AppState: ObservableObject {
                         userInput: userMessage,
                         commands: cmds,
                         summary: "Erro: \(error)",
-                        stepOutputs: outputs
+                        stepOutputs: outputs,
+                        tabId: tab.id,
+                        tabTitle: tab.title
                     )
                     self?.appendHistory(entry)
                 },
-                onToolMissing: { request in
+                onToolMissing: { [weak self] request in
                     state.pendingToolInstall = request
                     state.isShowingToolInstall = true
+                    request.resolver.onResolved = { [weak self, weak state] in
+                        Task { @MainActor in
+                            state?.isShowingToolInstall = false
+                            state?.pendingToolInstall = nil
+                            self?.notifyTabStateChanged()
+                        }
+                    }
                     self?.notifyTabStateChanged()
                 },
                 onSudoNeeded: { request in
@@ -739,7 +1006,9 @@ class AppState: ObservableObject {
                         userInput: "🌐 \(userMessage)",
                         commands: cmds,
                         summary: summary,
-                        stepOutputs: outputs
+                        stepOutputs: outputs,
+                        tabId: tab.id,
+                        tabTitle: tab.title
                     )
                     self?.appendHistory(entry)
                 }
@@ -765,7 +1034,9 @@ class AppState: ObservableObject {
                         type: .agentPlan,
                         userInput: "🌐 \(userMessage)",
                         commands: [],
-                        summary: "Erro: \(msg)"
+                        summary: "Erro: \(msg)",
+                        tabId: tab.id,
+                        tabTitle: tab.title
                     )
                     self?.appendHistory(entry)
                 }
@@ -789,7 +1060,7 @@ class AppState: ObservableObject {
         guard let state = activeAgentState, let request = state.pendingToolInstall else { return }
         state.isShowingToolInstall = false
         state.pendingToolInstall = nil
-        request.continuation.resume(returning: response)
+        request.resolver.resolve(response)
         notifyTabStateChanged()
     }
 
@@ -806,6 +1077,7 @@ class AppState: ObservableObject {
     func submitPromptInline(_ userMessage: String) {
         guard let tab = activeTab else { return }
         let state = agentState(for: tab.id)
+        let originatingTabId = tab.id
 
         isLoading = true
         state.errorMessage = nil
@@ -823,22 +1095,46 @@ class AppState: ObservableObject {
 
         let router = modelRouter
         let guard_ = commandGuard
+        let approvalMode = tab.approvalMode
 
-        Task { [weak self] in
+        // Wave 2 · C6: store the Task on the tab's TabAgentState so it can be
+        // cancelled when the tab closes or the user hits cancel. Without this,
+        // closing the tab mid-flight let the task complete and publish into a
+        // state already removed from the registry.
+        state.inlineTask?.cancel()
+        state.inlineTask = Task { [weak self] in
             do {
                 let plan = try await router.generatePlan(input: input)
+                try Task.checkCancellation()
                 await MainActor.run {
-                    state.currentPlan = plan
-                    state.guardResults = guard_.evaluatePlan(plan, approvalMode: tab.approvalMode)
-                    self?.isLoading = false
-                    state.isShowingApproval = true
-                    self?.notifyTabStateChanged()
+                    guard let self else { return }
+                    // Use the captured tabId — not activeTab — so the result is
+                    // applied to the tab that originated the request even if the
+                    // user has switched tabs in the meantime.
+                    let targetState = self.agentState(for: originatingTabId)
+                    targetState.currentPlan = plan
+                    targetState.guardResults = guard_.evaluatePlan(plan, approvalMode: approvalMode)
+                    targetState.isShowingApproval = true
+                    targetState.inlineTask = nil
+                    if self.activeTabId == originatingTabId {
+                        self.isLoading = false
+                    }
+                    self.notifyTabStateChanged()
                 }
+            } catch is CancellationError {
+                // Tab was closed or user cancelled — silently drop, the state was
+                // already reset by the canceller.
+                return
             } catch {
                 await MainActor.run {
-                    self?.isLoading = false
-                    state.errorMessage = error.localizedDescription
-                    self?.notifyTabStateChanged()
+                    guard let self else { return }
+                    let targetState = self.agentState(for: originatingTabId)
+                    targetState.errorMessage = error.localizedDescription
+                    targetState.inlineTask = nil
+                    if self.activeTabId == originatingTabId {
+                        self.isLoading = false
+                    }
+                    self.notifyTabStateChanged()
                 }
             }
         }
@@ -849,7 +1145,9 @@ class AppState: ObservableObject {
         let state = agentState(for: tab.id)
         guard let plan = state.currentPlan else { return }
 
-        let session = sessionManager.session(for: tab.id)
+        // Wave 6 · A9: route to the focused pane's session in mosaic mode.
+        let targetSessionId = effectiveSessionId(for: tab)
+        let session = sessionManager.session(for: targetSessionId, initialDirectory: tab.currentDirectory)
 
         for (index, command) in plan.commands.enumerated() {
             let result = state.guardResults.indices.contains(index)
@@ -875,5 +1173,46 @@ class AppState: ObservableObject {
 
     func currentGuardResults() -> [CommandGuard.GuardResult] {
         activeAgentState?.guardResults ?? []
+    }
+
+    // MARK: - Dry-run flow
+
+    /// Solicita um dry-run preview ao usuário e bloqueia até a decisão.
+    /// Chamado pelo AgentExecutor antes de executar ações destrutivas.
+    func requestDryRunApproval(plan: ExecutionPlan) async -> DryRunDecision {
+        await withCheckedContinuation { (cont: CheckedContinuation<DryRunDecision, Never>) in
+            self.dryRunDecisionContinuation = cont
+            self.pendingDryRunPlan = plan
+            self.isShowingDryRunPreview = true
+            // Persiste os steps planejados na timeline para servir como histórico
+            // mesmo se o usuário cancelar.
+            ExecutionLogStore.shared.append(plan.steps)
+        }
+    }
+
+    func approveDryRun() {
+        if let plan = pendingDryRunPlan {
+            // Marca os steps planejados como aprovados (UI vai atualizar quando
+            // executarem de fato e virarem .completed/.failed).
+            for step in plan.steps {
+                ExecutionLogStore.shared.updateStatus(id: step.id, to: .approved)
+            }
+        }
+        dryRunDecisionContinuation?.resume(returning: .approve)
+        dryRunDecisionContinuation = nil
+        isShowingDryRunPreview = false
+        pendingDryRunPlan = nil
+    }
+
+    func cancelDryRun() {
+        if let plan = pendingDryRunPlan {
+            for step in plan.steps {
+                ExecutionLogStore.shared.updateStatus(id: step.id, to: .cancelled)
+            }
+        }
+        dryRunDecisionContinuation?.resume(returning: .cancel)
+        dryRunDecisionContinuation = nil
+        isShowingDryRunPreview = false
+        pendingDryRunPlan = nil
     }
 }

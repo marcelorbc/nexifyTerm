@@ -134,8 +134,8 @@ final class NexPersistence {
 
     private var sessionURL: URL { baseDir.appendingPathComponent("session_tabs.json") }
 
-    func saveTabs(_ tabs: [SavedTab], activeTabIndex: Int?) {
-        let session = SavedSession(tabs: tabs, activeTabIndex: activeTabIndex)
+    func saveTabs(_ tabs: [SavedTab], activeTabIndex: Int?, activeTabId: UUID? = nil) {
+        let session = SavedSession(tabs: tabs, activeTabIndex: activeTabIndex, activeTabId: activeTabId)
         queue.sync { saveJSON(session, to: sessionURL) }
     }
 
@@ -157,6 +157,11 @@ final class NexPersistence {
 // MARK: - Session Persistence Models
 
 struct SavedTab: Codable {
+    /// Wave 3 · A7: persist the tab UUID so the active tab can be restored even
+    /// when the saved index points into a list that was filtered (e.g., a path
+    /// disappeared) on relaunch. Optional for backward compatibility with files
+    /// written by older builds.
+    let id: UUID?
     let title: String
     let currentDirectory: String
     let provider: String
@@ -164,8 +169,12 @@ struct SavedTab: Codable {
     let approvalMode: String
     let tabMode: String
     let isPinned: Bool
+    /// Wave 5 · A8: serialized mosaic layout. Optional so older session files
+    /// (and non-mosaic tabs) decode unchanged.
+    let mosaicLayout: MosaicNode?
 
     init(from tab: TerminalTab) {
+        self.id = tab.id
         self.title = tab.title
         self.currentDirectory = tab.currentDirectory
         self.provider = tab.provider.rawValue
@@ -173,16 +182,19 @@ struct SavedTab: Codable {
         self.approvalMode = tab.approvalMode.rawValue
         self.tabMode = tab.tabMode.rawValue
         self.isPinned = tab.isPinned
+        self.mosaicLayout = tab.mosaicLayout
     }
 
     func toTerminalTab() -> TerminalTab {
         TerminalTab(
+            id: id ?? UUID(),
             title: title,
             currentDirectory: currentDirectory,
             provider: ProviderType(rawValue: provider) ?? .ollama,
             model: model,
             approvalMode: ApprovalMode(rawValue: approvalMode) ?? .alwaysAsk,
             tabMode: TabMode(rawValue: tabMode) ?? .terminal,
+            mosaicLayout: mosaicLayout,
             isPinned: isPinned
         )
     }
@@ -190,7 +202,18 @@ struct SavedTab: Codable {
 
 struct SavedSession: Codable {
     let tabs: [SavedTab]
+    /// Legacy field; kept for back-compat with sessions written before A7.
+    /// Prefer `activeTabId` when present.
     let activeTabIndex: Int?
+    /// Wave 3 · A7: source of truth for the active tab. Survives filtering of
+    /// invalid tabs during restore (e.g., directories that no longer exist).
+    let activeTabId: UUID?
+
+    init(tabs: [SavedTab], activeTabIndex: Int? = nil, activeTabId: UUID? = nil) {
+        self.tabs = tabs
+        self.activeTabIndex = activeTabIndex
+        self.activeTabId = activeTabId
+    }
 }
 
 struct SidebarState: Codable {

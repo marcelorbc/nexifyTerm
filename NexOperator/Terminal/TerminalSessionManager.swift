@@ -13,7 +13,9 @@ class TerminalSessionManager {
     }
 
     func destroySession(for tabId: UUID) {
-        sessions.removeValue(forKey: tabId)
+        if let session = sessions.removeValue(forKey: tabId) {
+            session.terminate()
+        }
         NexLog.terminal.info("Destroyed terminal session for tab \(tabId)")
     }
 

@@ -188,6 +188,8 @@ struct GitStagingView: View {
                             selectedIds: selectedIds.wrappedValue,
                             isStaged: isStaged
                         ),
+                        fileURL: URL(fileURLWithPath: viewModel.repoPath)
+                            .appendingPathComponent(file.path),
                         onTap: { event in
                             handleClick(
                                 file: file,
@@ -490,6 +492,12 @@ struct DraggableFileRow: View {
     let allFiles: [GitFileStatus]
     let selectedIds: Binding<Set<String>>
     let dragPayload: String
+    /// Absolute URL of the file on disk, used so the drag is recognized by
+    /// external apps (Finder, Mail, Slack, ...) — without this, dragging out
+    /// of the app would fail because only the internal NSString payload was
+    /// registered. We register both: file-url for external apps and the
+    /// existing utf8PlainText payload for staged↔unstaged drops within the app.
+    let fileURL: URL?
     let onTap: (ClickModifiers) -> Void
     let onDoubleTap: () -> Void
     let onViewDiff: () -> Void
@@ -541,7 +549,16 @@ struct DraggableFileRow: View {
         .contentShape(Rectangle())
         .onHover { isHovered = $0 }
         .onDrag {
-            NSItemProvider(object: dragPayload as NSString)
+            let provider = NSItemProvider()
+            // Register file-url FIRST so external apps prefer it; the internal
+            // drop handlers explicitly ask for utf8PlainText, so they are not
+            // affected by this preference.
+            if let url = fileURL,
+               FileManager.default.fileExists(atPath: url.path) {
+                provider.registerObject(url as NSURL, visibility: .all)
+            }
+            provider.registerObject(dragPayload as NSString, visibility: .all)
+            return provider
         }
         .simultaneousGesture(
             TapGesture(count: 2).onEnded { onDoubleTap() }

@@ -98,6 +98,47 @@ struct PromptBuilder {
 
         You must transform the user's request into a safe terminal command plan.
 
+        === REGRA ANTI-PROMESSA (LEIA E SIGA - CRÍTICO) ===
+        Você é um agente que EXECUTA. Cada turno DEVE atender exatamente UMA destas
+        duas condições — nunca as duas, nunca nenhuma:
+          1) `commands` (ou `gitActions`/`fileActions`) contém o que executa a ação AGORA.
+          2) `commands` está vazio E `explanation`/`richOutput` já contêm o RESULTADO REAL
+             (com dados que vieram de comandos anteriores neste chat — não inferência).
+
+        ❌ PROIBIDO — PROMESSA FUTURA:
+        - "Vou fazer/extrair/inspecionar/agrupar/identificar/mapear/consolidar X"
+        - "Farei a extração agora"
+        - "Em breve mostrarei...", "Aguarde enquanto...", "Em seguida..."
+        - "No próximo passo eu posso..." / "Se quiser, posso aprofundar..."
+        - "Quer que eu detalhe X?" como única resposta
+        Nada disso é resposta válida. Se você está prestes a escrever isso, PARE e
+        coloque o comando real em `commands`.
+
+        ❌ PROIBIDO — FAKE COMPLETION (passado fingindo conclusão):
+        - "Organizei os diretórios... a classificação é inferida pelo nome das pastas"
+        - "Identifiquei as tecnologias... com base nos nomes"
+        - "Agrupei por categoria... ainda não abrimos cada projeto"
+        - "Mapeei a estrutura... pelo contexto"
+        Se admitiu que é "inferido pelo nome", "com base nos nomes", "pelo contexto",
+        "ainda não abrimos/inspecionamos" — você NÃO fez o trabalho. Use `commands`
+        para coletar dados reais (ex: `find . -maxdepth 2 -name "package.json"`,
+        `find . -maxdepth 2 -name "Cargo.toml" -o -name "go.mod" -o -name "*.csproj"`,
+        `head -1 */package.json 2>/dev/null`, `cat */package.json | jq .name`, etc).
+
+        ✅ EXEMPLOS VÁLIDOS:
+        - Pedido "agrupar projetos por tecnologia": `commands` contém um find por
+          manifestos de cada stack (`package.json`, `Cargo.toml`, `go.mod`, `pom.xml`,
+          `requirements.txt`, `pubspec.yaml`, `Gemfile`, `*.csproj`, `composer.json`).
+          No follow-up, você recebe os resultados e retorna `richOutput.table` com
+          dados REAIS (projeto → tecnologia detectada).
+        - Pedido "ler PDF": `commands` contém `pdftotext file.pdf -` ou
+          `python3 -c "import pypdf; ..."`. Sem ferramenta direta? Diga isso e
+          proponha instalar (`brew install poppler`).
+
+        Após receber o output de comandos no follow-up: retorne resultado final
+        em `explanation`/`richOutput`. NUNCA diga "vou processar isso agora".
+        === FIM REGRA ANTI-PROMESSA ===
+
         === VISUAL OUTPUT RULES (VERY IMPORTANT) ===
         The user sees command output in a real terminal. Make ALL output visually impressive:
 
@@ -134,6 +175,44 @@ struct PromptBuilder {
            - A colored header before the command
            - Human-readable flags
            - Sorted/filtered to show most relevant first
+
+        === ROBUSTEZ DE COMANDOS (CRÍTICO - LEIA COM ATENÇÃO) ===
+        Estas regras existem porque heredocs/one-liners com escape complexo quebram com frequência.
+        VIOLAR ESTAS REGRAS CAUSA ERROS REAIS. Siga sem exceções:
+
+        1. ESCOLHA DA FERRAMENTA por tipo de tarefa:
+           - Listar / inspecionar arquivos: comandos diretos (`ls`, `find`, `head`, `wc`, `du -h`).
+           - Transformar dados (CSV, JSON, XML, logs), gerar HTML/relatórios, parsing complexo,
+             qualquer lógica > 1 linha: SEMPRE crie um SCRIPT EM ARQUIVO e depois execute.
+           - NUNCA tente lógica complexa dentro de `printf`, `awk`, `sed` aninhados em uma linha.
+
+        2. PADRÃO OBRIGATÓRIO PARA SCRIPTS (Python preferido para texto/dados):
+           Passo A: criar o arquivo via `cat > /tmp/nex_<nome>.py <<'PY' ... PY` (delimitador
+                    SEMPRE entre aspas simples — `'PY'` — para evitar interpolação do shell).
+           Passo B: executar com `/usr/bin/python3 /tmp/nex_<nome>.py [args]`.
+           Vantagens: zero conflito de aspas, fácil de iterar/corrigir, o usuário vê o arquivo gerado.
+
+        3. ANTI-PADRÕES PROIBIDOS (não gerar nunca):
+           - `awk '{ ... $1 ... $5 ... }'` dentro de `/bin/zsh -lc '...'` com aspas duplas/simples
+             aninhadas (escape sempre quebra). Use awk em arquivo separado, ou Python.
+           - Python f-string com formatação dinâmica do tipo `{x:<{w}}` ou `{x.<{w}}` em heredoc
+             (parser falha). Use `.ljust(w)`, `.rjust(w)` ou `format()` com argumentos posicionais.
+           - Heredoc `<<EOF` SEM aspas no delimitador quando o corpo tem cifrão, contrabarra ou aspas duplas.
+             SEMPRE use `<<'EOF'` para conteúdo literal.
+           - Comandos que requerem que o shell preserve aspas do tipo `printf "...%s..." "$1"`
+             dentro de outro `printf "..." | awk "{...}"`. Quebre em arquivo de script.
+           - Pipelines de 4+ comandos com `awk`/`sed` para tarefas que cabem em um Python de 15 linhas.
+
+        4. ITERAÇÃO INTELIGENTE EM CASO DE FALHA:
+           - Se um comando falhou com `syntax error`, `unexpected token`, `parse error`,
+             NÃO tente o mesmo padrão de novo com pequenos ajustes.
+           - Reescreva como SCRIPT EM ARQUIVO (regra 2). Esta é a recuperação canônica.
+           - Use `/usr/bin/python3 -c "..."` apenas para coisas SIMPLES (≤ 60 chars, sem aspas
+             internas, sem f-strings com formatação dinâmica).
+
+        5. PRINCÍPIO: prefira clareza e robustez sobre "uma linha esperta".
+           Um script Python de 20 linhas que funciona é INFINITAMENTE melhor que um one-liner
+           awk/printf que falha. O usuário não se importa com o tamanho — só com o resultado.
 
         === COMMAND RULES ===
         - Never suggest destructive commands without explaining the risk.
@@ -233,6 +312,76 @@ struct PromptBuilder {
         """
     }
 
+    /// Renders the prior conversation turns (this tab only) into a compact text block
+    /// the LLM can use as short-term memory. Keeps within a sane token budget by truncating
+    /// outputs aggressively — full output is still re-fetched via terminal context when relevant.
+    /// Returns empty string when the user has `referenceChatHistory` disabled.
+    static func buildConversationHistoryBlock(_ turns: [ConversationTurn]) -> String {
+        guard ConfigStore.shared.referenceChatHistory else { return "" }
+        guard !turns.isEmpty else { return "" }
+
+        var block = "=== HISTÓRICO DESTA ABA (turnos anteriores - use para manter continuidade) ===\n"
+        block += "Você é o MESMO agente que executou os turnos abaixo NESTA aba. Mantenha contexto, "
+        block += "evite repetir checagens já feitas e referencie nomes/arquivos/paths já descobertos.\n\n"
+
+        for (i, turn) in turns.enumerated() {
+            let formatter = DateFormatter()
+            formatter.dateFormat = "HH:mm"
+            let when = formatter.string(from: turn.timestamp)
+            let status = turn.succeeded ? "✅" : "⚠️"
+
+            block += "--- Turno \(i + 1) (\(when)) \(status) ---\n"
+            block += "Usuário: \(turn.userMessage.prefix(400))\n"
+            if !turn.planTitle.isEmpty {
+                block += "Plano: \(turn.planTitle)\n"
+            }
+            if !turn.planExplanation.isEmpty {
+                block += "Explicação: \(turn.planExplanation)\n"
+            }
+
+            if !turn.stepBriefs.isEmpty {
+                block += "Comandos executados:\n"
+                for (idx, brief) in turn.stepBriefs.enumerated() {
+                    let icon = brief.succeeded ? "✓" : "✗"
+                    block += "  \(idx + 1). \(icon) `\(brief.command.prefix(180))` (exit \(brief.exitCode))\n"
+                    if !brief.stdoutHead.isEmpty {
+                        // Preserve newlines so list-style outputs stay enumerable.
+                        block += "     stdout:\n"
+                        for line in brief.stdoutHead.prefix(2000).components(separatedBy: "\n").prefix(60) {
+                            block += "       \(line)\n"
+                        }
+                    }
+                    if !brief.stderrHead.isEmpty {
+                        block += "     stderr: \(brief.stderrHead.prefix(400).replacingOccurrences(of: "\n", with: " ⏎ "))\n"
+                    }
+                }
+            }
+
+            if !turn.richOutputDigest.isEmpty {
+                block += "Resultado renderizado para o usuário (RichOutput):\n"
+                for line in turn.richOutputDigest.components(separatedBy: "\n").prefix(60) {
+                    block += "  \(line)\n"
+                }
+            }
+
+            if !turn.summary.isEmpty {
+                block += "Resumo: \(turn.summary.prefix(500))\n"
+            }
+            block += "\n"
+        }
+
+        block += "=== FIM HISTÓRICO ===\n"
+        block += "REGRAS DE CONTINUIDADE (obrigatórias):\n"
+        block += "1. Se o usuário enviar uma mensagem curta (ex: \"1\", \"o primeiro\", \"sim\", \"continue\", \"esse\", \"aquele arquivo\"), "
+        block += "RESOLVA a referência usando o último turno relevante acima — nunca peça para ele \"repetir a lista\".\n"
+        block += "2. Números nuus (1, 2, 3) referem-se a posições da última lista enumerada (stdout, RichOutput.table, ou comandos executados).\n"
+        block += "3. Antes de pedir confirmação, INFIRA do histórico — só pergunte se houver ambiguidade real entre múltiplos itens prováveis.\n"
+        block += "4. Se você listou itens no turno anterior, mantenha a mesma ordem/numeração nos próximos turnos.\n"
+        block += "5. Quando produzir uma lista que pode ser referenciada depois, ENUMERE explicitamente (1., 2., 3.) no richOutput.table ou na explanation, "
+        block += "para que \"item 2\" seja resolvível no próximo turno.\n\n"
+        return block
+    }
+
     static func buildSkillContext(from message: String) -> (skill: Skill, cleanMessage: String)? {
         guard message.hasPrefix("[SKILL: ") else { return nil }
         let parts = message.components(separatedBy: "\n\nUser request: ")
@@ -249,13 +398,26 @@ struct PromptBuilder {
         return (skill, cleanMessage)
     }
 
-    static func buildUserPrompt(from input: AgentInput) -> String {
+    static func buildUserPrompt(
+        from input: AgentInput,
+        personalization: PersonalizationContext.Snapshot = PersonalizationContext.currentSnapshot()
+    ) -> String {
         var prompt = """
         System: \(input.operatingSystem)
         Shell: \(input.shell)
         Current directory: \(input.currentDirectory)
 
         """
+
+        let memoryBlock = PersonalizationContext.memoryBlock(personalization)
+        if !memoryBlock.isEmpty {
+            prompt += memoryBlock
+        }
+
+        let historyBlock = buildConversationHistoryBlock(input.conversationTurns)
+        if !historyBlock.isEmpty {
+            prompt += historyBlock
+        }
 
         if !input.terminalContext.isEmpty {
             let contextLines = input.terminalContext.components(separatedBy: "\n")
@@ -330,20 +492,31 @@ struct PromptBuilder {
     }
 
     static func buildMessages(from input: AgentInput) -> [[String: String]] {
+        let personalization = PersonalizationContext.currentSnapshot()
+        let personaPrefix = PersonalizationContext.systemBlock(personalization)
+
         if input.isBrowserMode {
             return [
-                ["role": "system", "content": buildBrowserSystemPrompt()],
-                ["role": "user", "content": buildBrowserUserPrompt(from: input)]
+                ["role": "system", "content": personaPrefix + buildBrowserSystemPrompt()],
+                ["role": "user", "content": buildBrowserUserPrompt(from: input, personalization: personalization)]
             ]
         }
         return [
-            ["role": "system", "content": buildSystemPrompt()],
-            ["role": "user", "content": buildUserPrompt(from: input)]
+            ["role": "system", "content": personaPrefix + buildSystemPrompt()],
+            ["role": "user", "content": buildUserPrompt(from: input, personalization: personalization)]
         ]
     }
 
-    static func buildBrowserUserPrompt(from input: AgentInput) -> String {
-        var prompt = "Current page info:\n"
+    static func buildBrowserUserPrompt(
+        from input: AgentInput,
+        personalization: PersonalizationContext.Snapshot = PersonalizationContext.currentSnapshot()
+    ) -> String {
+        var prompt = ""
+        let memoryBlock = PersonalizationContext.memoryBlock(personalization)
+        if !memoryBlock.isEmpty {
+            prompt += memoryBlock
+        }
+        prompt += "Current page info:\n"
         if !input.browserPageInfo.isEmpty {
             prompt += input.browserPageInfo.prefix(4000) + "\n\n"
         } else {
@@ -405,6 +578,11 @@ struct PromptBuilder {
         - If a command was blocked, try a different approach without sudo
         - If a command timed out, consider a lighter alternative
         - Always use full absolute paths for macOS system tools (e.g. /usr/sbin/scutil, /usr/bin/sw_vers)
+        - SE A FALHA FOI DE SINTAXE (awk syntax error, python SyntaxError, parse error,
+          unexpected token, illegal statement): NÃO repita variações do mesmo one-liner.
+          Reescreva como SCRIPT EM ARQUIVO: `cat > /tmp/nex_<nome>.py <<'PY' ... PY`
+          e depois `/usr/bin/python3 /tmp/nex_<nome>.py`. Heredoc com delimitador entre aspas
+          simples ('PY') evita interpolação do shell.
         - ALWAYS format output with ANSI colors, emojis, section headers, and aligned columns
         - If showing a summary or final result, use a beautiful formatted box with colors
 
@@ -463,13 +641,26 @@ struct PromptBuilder {
         """
     }
 
-    static func buildToolCallingUserPrompt(from input: AgentInput) -> String {
+    static func buildToolCallingUserPrompt(
+        from input: AgentInput,
+        personalization: PersonalizationContext.Snapshot = PersonalizationContext.currentSnapshot()
+    ) -> String {
         var prompt = """
         Sistema: \(input.operatingSystem)
         Shell: \(input.shell)
         Diretório atual: \(input.currentDirectory)
 
         """
+
+        let memoryBlock = PersonalizationContext.memoryBlock(personalization)
+        if !memoryBlock.isEmpty {
+            prompt += memoryBlock
+        }
+
+        let historyBlock = buildConversationHistoryBlock(input.conversationTurns)
+        if !historyBlock.isEmpty {
+            prompt += historyBlock
+        }
 
         if !input.terminalContext.isEmpty {
             let contextLines = input.terminalContext.components(separatedBy: "\n")
@@ -519,6 +710,14 @@ struct PromptBuilder {
         You can execute TWO types of actions:
         1. **gitActions**: Direct Git operations executed via the app's Git engine (preferred — safer, faster, updates UI automatically)
         2. **commands**: Shell commands for advanced operations not covered by gitActions
+
+        === REGRA ANTI-PROMESSA (CRÍTICO) ===
+        Você EXECUTA. PROIBIDO:
+        - Futuro: "vou fazer", "farei o commit em seguida", "em breve...", "no próximo passo posso...".
+        - Passado fingido: "Organizei", "Identifiquei", "Mapeei" sem rodar comando E sem dados reais.
+        - Fake follow-up: "Se quiser, posso aprofundar" como única resposta.
+        Cada turno: ou `gitActions`/`commands` faz o trabalho AGORA, ou `explanation`/`richOutput`
+        já contém o resultado final com dados reais.
 
         === GIT ACTIONS (gitActions array) ===
         Available gitAction types:
@@ -579,7 +778,11 @@ struct PromptBuilder {
         """
     }
 
-    static func buildGitUserPrompt(from input: AgentInput, gitContext: String) -> String {
+    static func buildGitUserPrompt(
+        from input: AgentInput,
+        gitContext: String,
+        personalization: PersonalizationContext.Snapshot = PersonalizationContext.currentSnapshot()
+    ) -> String {
         var prompt = """
         System: \(input.operatingSystem)
         Shell: \(input.shell)
@@ -588,6 +791,16 @@ struct PromptBuilder {
         \(gitContext)
 
         """
+
+        let memoryBlock = PersonalizationContext.memoryBlock(personalization)
+        if !memoryBlock.isEmpty {
+            prompt += memoryBlock
+        }
+
+        let historyBlock = buildConversationHistoryBlock(input.conversationTurns)
+        if !historyBlock.isEmpty {
+            prompt += historyBlock
+        }
 
         if !input.terminalContext.isEmpty {
             let contextLines = input.terminalContext.components(separatedBy: "\n")
@@ -632,6 +845,14 @@ struct PromptBuilder {
         1. **fileActions**: Direct file operations executed via the app's file engine (preferred — safer, updates UI automatically)
         2. **commands**: Shell commands for advanced operations not covered by fileActions
 
+        === REGRA ANTI-PROMESSA (CRÍTICO) ===
+        Você EXECUTA. PROIBIDO:
+        - Futuro: "vou fazer", "farei a análise em seguida", "em breve...", "no próximo passo posso...".
+        - Passado fingido: "Organizei", "Identifiquei", "Mapeei" sem rodar comando E sem dados reais.
+        - Fake follow-up: "Se quiser, posso aprofundar" como única resposta.
+        Cada turno: ou `fileActions`/`commands` faz o trabalho AGORA, ou `explanation`/`richOutput`
+        já contém o resultado final com dados reais.
+
         === FILE ACTIONS (fileActions array) ===
         Available fileAction types:
         - "createFolder": Create a new folder. params: { "name": "folder-name" }
@@ -674,7 +895,11 @@ struct PromptBuilder {
         """
     }
 
-    static func buildExplorerUserPrompt(from input: AgentInput, explorerContext: String) -> String {
+    static func buildExplorerUserPrompt(
+        from input: AgentInput,
+        explorerContext: String,
+        personalization: PersonalizationContext.Snapshot = PersonalizationContext.currentSnapshot()
+    ) -> String {
         var prompt = """
         System: \(input.operatingSystem)
         Shell: \(input.shell)
@@ -683,6 +908,16 @@ struct PromptBuilder {
         \(explorerContext)
 
         """
+
+        let memoryBlock = PersonalizationContext.memoryBlock(personalization)
+        if !memoryBlock.isEmpty {
+            prompt += memoryBlock
+        }
+
+        let historyBlock = buildConversationHistoryBlock(input.conversationTurns)
+        if !historyBlock.isEmpty {
+            prompt += historyBlock
+        }
 
         if !input.terminalContext.isEmpty {
             let contextLines = input.terminalContext.components(separatedBy: "\n")
@@ -715,16 +950,19 @@ struct PromptBuilder {
     // MARK: - Context-aware message builder
 
     static func buildMessages(from input: AgentInput, tabMode: TabMode, contextExtra: String = "") -> [[String: String]] {
+        let personalization = PersonalizationContext.currentSnapshot()
+        let personaPrefix = PersonalizationContext.systemBlock(personalization)
+
         switch tabMode {
         case .git:
             return [
-                ["role": "system", "content": buildGitSystemPrompt()],
-                ["role": "user", "content": buildGitUserPrompt(from: input, gitContext: contextExtra)]
+                ["role": "system", "content": personaPrefix + buildGitSystemPrompt()],
+                ["role": "user", "content": buildGitUserPrompt(from: input, gitContext: contextExtra, personalization: personalization)]
             ]
         case .explorer:
             return [
-                ["role": "system", "content": buildExplorerSystemPrompt()],
-                ["role": "user", "content": buildExplorerUserPrompt(from: input, explorerContext: contextExtra)]
+                ["role": "system", "content": personaPrefix + buildExplorerSystemPrompt()],
+                ["role": "user", "content": buildExplorerUserPrompt(from: input, explorerContext: contextExtra, personalization: personalization)]
             ]
         default:
             return buildMessages(from: input)

@@ -9,17 +9,23 @@ struct FileBrowserSidebarView: View {
     @State private var sidebarWidth: CGFloat = 220
     @State private var renamingFavoriteID: UUID? = nil
     @State private var renamingText: String = ""
+    /// Sinal para forçar scroll on-demand (botão "scope"). Toda vez que muda
+    /// o sidebar consome o valor e scrolla até ele. Usar UUID + path em vez
+    /// de só path evita não-disparar quando o usuário clica scope duas
+    /// vezes seguidas no mesmo path.
+    @State private var revealRequest: (id: UUID, path: String)? = nil
 
     private let minSidebarWidth: CGFloat = 180
     private let maxSidebarWidth: CGFloat = 400
 
-    private var activeExplorerDirectory: String? {
-        guard let tab = appState.activeTab, tab.isExplorer else { return nil }
-        return tab.currentDirectory
-    }
-
+    /// Diretório que o sidebar destaca/expande. Antes só refletia abas
+    /// Explorer — agora qualquer aba (terminal, git, mosaic) propaga o
+    /// `currentDirectory`, atendendo ao caso "estou no terminal e quero
+    /// ver onde estou no sidebar". Normalizado via `standardizingPath`
+    /// pra comparar bem com URLs do FileManager.
     private var activeTabDirectory: String? {
-        appState.activeTab?.currentDirectory
+        guard let dir = appState.activeTab?.currentDirectory else { return nil }
+        return (dir as NSString).standardizingPath
     }
 
     var body: some View {
@@ -29,9 +35,36 @@ struct FileBrowserSidebarView: View {
 
                 sidebarToolbar
 
+                activeTabBreadcrumb
+
                 Divider()
 
+                ScrollViewReader { proxy in
                 List {
+                    // "Pastas" fica no topo deliberadamente: é a seção mais
+                    // alta e mais usada no dia-a-dia. Antes ficava embaixo
+                    // de Favoritos+Recentes e o auto-scroll para a aba
+                    // ativa caía numa posição confusa, com Favoritos
+                    // ainda ocupando metade da viewport. Agora a árvore é
+                    // a primeira coisa que o usuário vê.
+                    Section("Pastas") {
+                        FolderTreeNode(
+                            url: rootURL,
+                            expandedFolders: $expandedFolders,
+                            highlightedPath: activeTabDirectory,
+                            depth: 0,
+                            onOpenExplorer: { url in
+                                navigateOrOpenExplorer(url.path)
+                            },
+                            onOpenTerminal: { url in
+                                appState.createTab(directory: url.path)
+                            },
+                            onOpenGit: { url in
+                                appState.addGitTab(directory: url.path)
+                            }
+                        )
+                    }
+
                     Section("Favoritos") {
                         ForEach(favoritesStore.favorites) { fav in
                             if renamingFavoriteID == fav.id {
@@ -63,6 +96,9 @@ struct FileBrowserSidebarView: View {
                                         favoriteSidebarMenu(fav)
                                     }
                                 )
+                                .onDrag {
+                                    NSItemProvider(object: URL(fileURLWithPath: fav.path) as NSURL)
+                                }
                             }
                         }
                     }
@@ -85,6 +121,9 @@ struct FileBrowserSidebarView: View {
                                     }
                                 }
                                 .buttonStyle(.plain)
+                                .onDrag {
+                                    NSItemProvider(object: URL(fileURLWithPath: recent.path) as NSURL)
+                                }
                                 .contextMenu {
                                     Button { appState.createTab(directory: recent.path) } label: {
                                         Label("Terminal", systemImage: "terminal.fill")
@@ -95,6 +134,9 @@ struct FileBrowserSidebarView: View {
                                     Button { appState.addGitTab(directory: recent.path) } label: {
                                         Label("Git", systemImage: "arrow.triangle.branch")
                                     }
+                                    Button { appState.addDiskAnalyzerTab(directory: recent.path) } label: {
+                                        Label("Disk Analyzer", systemImage: "chart.pie.fill")
+                                    }
                                     Divider()
                                     Button("Remover dos Recentes") {
                                         recentStore.remove(recent.path)
@@ -102,24 +144,6 @@ struct FileBrowserSidebarView: View {
                                 }
                             }
                         }
-                    }
-
-                    Section("Pastas") {
-                        FolderTreeNode(
-                            url: rootURL,
-                            expandedFolders: $expandedFolders,
-                            highlightedPath: activeExplorerDirectory,
-                            depth: 0,
-                            onOpenExplorer: { url in
-                                navigateOrOpenExplorer(url.path)
-                            },
-                            onOpenTerminal: { url in
-                                appState.createTab(directory: url.path)
-                            },
-                            onOpenGit: { url in
-                                appState.addGitTab(directory: url.path)
-                            }
-                        )
                     }
 
                     Section("Tags") {
@@ -135,6 +159,40 @@ struct FileBrowserSidebarView: View {
                     }
                 }
                 .listStyle(.sidebar)
+                .onChange(of: activeTabDirectory) { oldDir, newDir in
+                    // Reage à navegação dentro da mesma aba — antes só
+                    // reagíamos a `tabStateVersion`, mas como `currentDirectory`
+                    // pode mudar sem bumpar a version em alguns paths
+                    // (mosaic/terminal), observamos o computed direto.
+                    expandToActiveTab()
+                    // Auto-scroll deliberadamente conservador. Antes
+                    // (`anchor: .center`) o sidebar centralizava o item da
+                    // aba — só que com Favoritos + Recentes acima da seção
+                    // Pastas, "centralizar" jogava o foco visual num
+                    // lugar confuso (o usuário relatou "ficar doido").
+                    // Agora:
+                    //   - SÓ scrolla quando o destino mudou DE FATO,
+                    //   - usa .top (item vai pro topo visível) sem animação
+                    //     para snap imediato, sem sensação de "deslizou e
+                    //     perdi o lugar",
+                    //   - delay maior (250ms) para garantir que os nodes
+                    //     novos da árvore já existem antes do scrollTo.
+                    guard let dir = newDir, dir != oldDir else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        proxy.scrollTo(dir, anchor: .top)
+                    }
+                }
+                .onChange(of: revealRequest?.id) { _, _ in
+                    // Scroll on-demand quando o usuário clica no botão "scope".
+                    guard let req = revealRequest else { return }
+                    expandToActiveTab()
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                        withAnimation(.easeInOut(duration: 0.25)) {
+                            proxy.scrollTo(req.path, anchor: .top)
+                        }
+                    }
+                }
+                }
             }
             .frame(width: sidebarWidth)
             .onAppear {
@@ -225,6 +283,55 @@ struct FileBrowserSidebarView: View {
         .background(NexTheme.surface.opacity(0.4))
     }
 
+    /// Mini-breadcrumb que mostra QUAL aba está sendo refletida no sidebar.
+    /// Sempre visível (mesmo quando o usuário rola pra fora) para o foco
+    /// nunca se perder. Click leva o sidebar até a pasta da aba.
+    @ViewBuilder
+    private var activeTabBreadcrumb: some View {
+        if let dir = activeTabDirectory {
+            let url = URL(fileURLWithPath: dir)
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            let display = dir.hasPrefix(home) ? "~" + dir.dropFirst(home.count) : dir
+            let folderName = url.lastPathComponent
+
+            Button {
+                revealActiveFolder()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "scope")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(.accentColor)
+                    Text(folderName)
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(.accentColor)
+                        .lineLimit(1)
+                    Text(display)
+                        .font(.system(size: 9, design: .monospaced))
+                        .foregroundColor(NexTheme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                    Spacer()
+                    Image(systemName: "arrow.right.to.line")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(NexTheme.textSecondary)
+                }
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.accentColor.opacity(0.10))
+                .overlay(
+                    Rectangle()
+                        .fill(Color.accentColor.opacity(0.4))
+                        .frame(width: 2),
+                    alignment: .leading
+                )
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Aba ativa: \(dir)\nClique para focar no sidebar")
+        }
+    }
+
     private func sidebarButton(icon: String, help: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Image(systemName: icon)
@@ -252,6 +359,10 @@ struct FileBrowserSidebarView: View {
             current += "/\(component)"
             expandedFolders.insert(current)
         }
+        // Sinaliza para o ScrollViewReader rolar até a pasta — usa um id
+        // novo a cada chamada para que cliques repetidos no botão "scope"
+        // sempre disparem o scroll (mesmo se o path não mudou).
+        revealRequest = (UUID(), dir)
     }
 
     private func expandAll() {
@@ -310,6 +421,9 @@ struct FileBrowserSidebarView: View {
                 }
                 Button { appState.addGitTab(directory: fav.path) } label: {
                     Label("Git", systemImage: "arrow.triangle.branch")
+                }
+                Button { appState.addDiskAnalyzerTab(directory: fav.path) } label: {
+                    Label("Disk Analyzer", systemImage: "chart.pie.fill")
                 }
             } else {
                 Button { FileItemProvider.openFile(URL(fileURLWithPath: fav.path)) } label: {
@@ -376,7 +490,7 @@ struct FileBrowserSidebarView: View {
     }
 
     private func expandToActiveTab() {
-        guard let dir = activeExplorerDirectory else { return }
+        guard let dir = activeTabDirectory else { return }
         let home = rootURL.path
         guard dir.hasPrefix(home) else { return }
 
@@ -433,6 +547,10 @@ struct FolderTreeNode: View {
 
     @State private var children: [URL] = []
     @State private var isGitRepo = false
+    /// Pulsa o background quando este node se torna o destacado da aba
+    /// ativa — chama atenção visual após o auto-scroll. Decai naturalmente
+    /// para o highlight estável (opacity 0.12) em ~900 ms.
+    @State private var pulseHighlight = false
 
     private var isExpanded: Bool {
         expandedFolders.contains(url.path)
@@ -440,11 +558,19 @@ struct FolderTreeNode: View {
 
     private var isHighlighted: Bool {
         guard let path = highlightedPath else { return false }
-        return path == url.path || path.hasPrefix(url.path + "/")
+        let normalized = (url.path as NSString).standardizingPath
+        return path == normalized || path.hasPrefix(normalized + "/")
     }
 
     private var isExactMatch: Bool {
-        highlightedPath == url.path
+        guard let path = highlightedPath else { return false }
+        return path == (url.path as NSString).standardizingPath
+    }
+
+    /// Path normalizado — usado como `.id` para o ScrollViewReader localizar
+    /// este node pelo mesmo formato de string que o sidebar usa.
+    private var normalizedPath: String {
+        (url.path as NSString).standardizingPath
     }
 
     var body: some View {
@@ -475,6 +601,19 @@ struct FolderTreeNode: View {
                             .foregroundColor(.green)
                     }
 
+                    if isExactMatch {
+                        // Tag visual deixando claro que ESTE é o path da
+                        // aba atualmente focada. Ajuda quando o usuário
+                        // abriu múltiplas abas e quer confirmar onde está.
+                        Text("aba")
+                            .font(.system(size: 8, weight: .bold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 4)
+                            .padding(.vertical, 1)
+                            .background(Color.accentColor)
+                            .cornerRadius(3)
+                    }
+
                     Spacer()
                 }
                 .padding(.leading, CGFloat(depth) * 12 + 4)
@@ -482,8 +621,22 @@ struct FolderTreeNode: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .background(isExactMatch ? Color.accentColor.opacity(0.12) : Color.clear)
+            .background(
+                Color.accentColor.opacity(
+                    isExactMatch
+                        ? (pulseHighlight ? 0.40 : 0.12)
+                        : 0
+                )
+            )
             .cornerRadius(4)
+            .id(normalizedPath)
+            .onDrag {
+                NSItemProvider(object: url as NSURL)
+            }
+            .onChange(of: isExactMatch) { _, newValue in
+                guard newValue else { return }
+                triggerPulse()
+            }
             .contextMenu {
                 Button { onOpenTerminal(url) } label: {
                     Label("Terminal", systemImage: "terminal.fill")
@@ -538,10 +691,38 @@ struct FolderTreeNode: View {
                 }
             }
         }
-        .onAppear { checkGitRepo() }
+        .onAppear {
+            checkGitRepo()
+            // Bug fix crítico: quando o sidebar pré-expande pastas para
+            // chegar até o diretório da aba ativa, os FolderTreeNode dos
+            // descendentes só aparecem APÓS o parent renderizar. Para esses
+            // nodes, `expandedFolders` já contém seu path no momento do
+            // primeiro render — `.onChange` não dispara para o valor
+            // inicial, então sem isto eles ficavam vazios até o usuário
+            // clicar manualmente.
+            if isExpanded && children.isEmpty {
+                loadChildren()
+            }
+            // Pulse inicial quando o node JÁ aparece destacado (caso de
+            // troca de aba que pré-expandiu até ele).
+            if isExactMatch {
+                triggerPulse()
+            }
+        }
         .onChange(of: expandedFolders) { _, newValue in
             if newValue.contains(url.path) && children.isEmpty {
                 loadChildren()
+            }
+        }
+    }
+
+    private func triggerPulse() {
+        pulseHighlight = true
+        // Delay mínimo pra garantir que o snap inicial seja visível
+        // antes do decay começar.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            withAnimation(.easeOut(duration: 0.9)) {
+                pulseHighlight = false
             }
         }
     }

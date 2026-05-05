@@ -1,7 +1,93 @@
 import SwiftUI
 
+// MARK: - Grouping
+
+/// One group of history entries that all came from the same tab. Used to render
+/// collapsible sections in the panel/modal so the user can see "Histórico desta aba"
+/// and not just a flat firehose of every message ever sent.
+struct HistoryGroup: Identifiable {
+    let id: String
+    let tabId: UUID?
+    /// Primary heading shown for this group. Prefers the LLM-generated
+    /// conversation title (ChatGPT-style); falls back to the tab name.
+    let title: String
+    /// Whether `title` came from the LLM titler. Drives the small "✨" badge.
+    let titleFromLLM: Bool
+    /// Tab name (current or last-known). Always populated; useful for the
+    /// secondary line under the conversation title.
+    let tabName: String
+    let entries: [HistoryEntry]    // newest first
+
+    var lastActivity: Date { entries.first?.timestamp ?? .distantPast }
+    var firstActivity: Date { entries.last?.timestamp ?? .distantPast }
+    var count: Int { entries.count }
+
+    var subtitle: String {
+        let formatter = DateFormatter()
+        let calendar = Calendar.current
+        if calendar.isDateInToday(lastActivity) {
+            formatter.dateFormat = "HH:mm"
+            return "Hoje · \(formatter.string(from: lastActivity))"
+        }
+        if calendar.isDateInYesterday(lastActivity) {
+            formatter.dateFormat = "HH:mm"
+            return "Ontem · \(formatter.string(from: lastActivity))"
+        }
+        formatter.dateFormat = "dd/MM HH:mm"
+        return formatter.string(from: lastActivity)
+    }
+}
+
+enum HistoryGrouper {
+    /// Groups entries by `tabId`, preserving most-recent-activity ordering and
+    /// resolving the displayed tab title to whatever the active tab is named
+    /// today (falls back to whatever was saved in the entry). Optionally
+    /// resolves an LLM-generated conversation title via `conversationTitles`.
+    static func group(
+        entries: [HistoryEntry],
+        currentTabTitles: [UUID: String],
+        conversationTitles: [UUID: String] = [:]
+    ) -> [HistoryGroup] {
+        var buckets: [String: [HistoryEntry]] = [:]
+        var order: [String] = []
+
+        for entry in entries.reversed() {  // newest first
+            let key = entry.tabId?.uuidString ?? "__legacy__"
+            if buckets[key] == nil {
+                buckets[key] = []
+                order.append(key)
+            }
+            buckets[key]?.append(entry)
+        }
+
+        return order.compactMap { key -> HistoryGroup? in
+            guard let bucket = buckets[key], !bucket.isEmpty else { return nil }
+            let tabId = bucket.first?.tabId
+            let tabName: String = {
+                if let tabId, let live = currentTabTitles[tabId] { return live }
+                if let saved = bucket.first?.tabTitle, !saved.isEmpty { return saved }
+                return "Aba removida"
+            }()
+            let llmTitle: String? = {
+                guard let tabId, let t = conversationTitles[tabId], !t.isEmpty else { return nil }
+                return t
+            }()
+            let title = llmTitle ?? tabName
+            return HistoryGroup(
+                id: key,
+                tabId: tabId,
+                title: title,
+                titleFromLLM: llmTitle != nil,
+                tabName: tabName,
+                entries: bucket
+            )
+        }
+    }
+}
+
 struct HistoryPanelView: View {
     @EnvironmentObject var appState: AppState
+    @ObservedObject private var titleStore = ConversationTitleStore.shared
     let onReplay: (HistoryEntry) -> Void
     let onClose: () -> Void
 
@@ -78,6 +164,18 @@ struct HistoryPanelView: View {
         }
     }
 
+    private var groups: [HistoryGroup] {
+        let titles = Dictionary(uniqueKeysWithValues: appState.tabs.map { ($0.id, $0.title) })
+        let convTitles = titleStore.titles.reduce(into: [UUID: String]()) { acc, kv in
+            acc[kv.key] = kv.value.title
+        }
+        return HistoryGrouper.group(
+            entries: appState.history,
+            currentTabTitles: titles,
+            conversationTitles: convTitles
+        )
+    }
+
     @ViewBuilder
     private var historyContent: some View {
         if appState.history.isEmpty {
@@ -94,11 +192,13 @@ struct HistoryPanelView: View {
             .frame(maxWidth: .infinity)
         } else {
             ScrollView {
-                LazyVStack(spacing: 2) {
-                    ForEach(appState.history.reversed()) { entry in
-                        HistoryRowView(entry: entry, onReplay: {
-                            onReplay(entry)
-                        })
+                LazyVStack(spacing: 4, pinnedViews: []) {
+                    ForEach(groups) { group in
+                        HistoryGroupSection(
+                            group: group,
+                            isActiveTab: group.tabId == appState.activeTabId,
+                            onReplay: onReplay
+                        )
                     }
                 }
                 .padding(.vertical, 4)
@@ -129,20 +229,37 @@ struct HistoryPanelView: View {
 
 struct HistoryModalView: View {
     @EnvironmentObject var appState: AppState
+    @ObservedObject private var titleStore = ConversationTitleStore.shared
     @Environment(\.dismiss) private var dismiss
     let onReplay: (HistoryEntry) -> Void
 
     @State private var searchText = ""
 
-    private var filtered: [HistoryEntry] {
-        let reversed = appState.history.reversed()
-        if searchText.isEmpty { return Array(reversed) }
-        let q = searchText.lowercased()
-        return reversed.filter {
-            $0.userInput.lowercased().contains(q) ||
-            $0.commands.joined(separator: " ").lowercased().contains(q) ||
-            ($0.summary ?? "").lowercased().contains(q)
+    private func matches(_ entry: HistoryEntry, query: String) -> Bool {
+        if query.isEmpty { return true }
+        let q = query.lowercased()
+        if entry.userInput.lowercased().contains(q) { return true }
+        if entry.commands.joined(separator: " ").lowercased().contains(q) { return true }
+        if (entry.summary ?? "").lowercased().contains(q) { return true }
+        if (entry.tabTitle ?? "").lowercased().contains(q) { return true }
+        return false
+    }
+
+    private var groups: [HistoryGroup] {
+        let titles = Dictionary(uniqueKeysWithValues: appState.tabs.map { ($0.id, $0.title) })
+        let convTitles = titleStore.titles.reduce(into: [UUID: String]()) { acc, kv in
+            acc[kv.key] = kv.value.title
         }
+        let filtered = appState.history.filter { matches($0, query: searchText) }
+        return HistoryGrouper.group(
+            entries: filtered,
+            currentTabTitles: titles,
+            conversationTitles: convTitles
+        )
+    }
+
+    private var totalEntries: Int {
+        groups.reduce(0) { $0 + $1.count }
     }
 
     var body: some View {
@@ -156,7 +273,7 @@ struct HistoryModalView: View {
 
                 Spacer()
 
-                Text("\(appState.history.count) entradas")
+                Text("\(totalEntries) em \(groups.count) aba(s)")
                     .font(.caption)
                     .foregroundColor(NexTheme.textSecondary)
 
@@ -172,7 +289,7 @@ struct HistoryModalView: View {
             HStack {
                 Image(systemName: "magnifyingglass")
                     .foregroundColor(NexTheme.textSecondary)
-                TextField("Buscar no histórico...", text: $searchText)
+                TextField("Buscar no histórico (mensagem, comando, aba)...", text: $searchText)
                     .textFieldStyle(.plain)
                     .foregroundColor(NexTheme.textPrimary)
                 if !searchText.isEmpty {
@@ -193,12 +310,23 @@ struct HistoryModalView: View {
             Divider().padding(.top, 8)
 
             ScrollView {
-                LazyVStack(spacing: 4) {
-                    ForEach(filtered) { entry in
-                        HistoryRowView(entry: entry, onReplay: {
-                            onReplay(entry)
-                            dismiss()
-                        })
+                LazyVStack(spacing: 8) {
+                    ForEach(groups) { group in
+                        HistoryGroupSection(
+                            group: group,
+                            isActiveTab: group.tabId == appState.activeTabId,
+                            onReplay: { entry in
+                                onReplay(entry)
+                                dismiss()
+                            }
+                        )
+                    }
+                    if groups.isEmpty {
+                        Text(searchText.isEmpty ? "Nenhuma entrada" : "Nada encontrado para \"\(searchText)\"")
+                            .font(.system(size: 12))
+                            .foregroundColor(NexTheme.textSecondary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 40)
                     }
                 }
                 .padding(8)
@@ -207,6 +335,210 @@ struct HistoryModalView: View {
         .frame(minWidth: 600, minHeight: 400)
         .frame(idealWidth: 750, idealHeight: 550)
         .background(Color(nsColor: .windowBackgroundColor))
+    }
+}
+
+// MARK: - Collapsible group section
+
+struct HistoryGroupSection: View {
+    let group: HistoryGroup
+    let isActiveTab: Bool
+    let onReplay: (HistoryEntry) -> Void
+
+    @State private var isExpanded: Bool
+    @State private var copiedAll: Bool = false
+
+    init(group: HistoryGroup, isActiveTab: Bool, onReplay: @escaping (HistoryEntry) -> Void) {
+        self.group = group
+        self.isActiveTab = isActiveTab
+        self.onReplay = onReplay
+        // Auto-expand the active tab; collapse everything else by default to
+        // keep the panel readable even after dozens of sessions.
+        _isExpanded = State(initialValue: isActiveTab)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            header
+            if isExpanded {
+                VStack(spacing: 1) {
+                    ForEach(group.entries) { entry in
+                        HistoryRowView(entry: entry, onReplay: { onReplay(entry) })
+                    }
+                }
+                .padding(.top, 2)
+            }
+        }
+        .padding(.horizontal, 6)
+    }
+
+    private var header: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    isExpanded.toggle()
+                }
+            } label: {
+                HStack(alignment: .top, spacing: 6) {
+                    Image(systemName: isExpanded ? "chevron.down" : "chevron.right")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundColor(NexTheme.textSecondary)
+                        .frame(width: 12)
+                        .padding(.top, 2)
+
+                    Image(systemName: isActiveTab ? "rectangle.fill.on.rectangle.fill" : "rectangle.on.rectangle")
+                        .font(.system(size: 10))
+                        .foregroundColor(isActiveTab ? .accentColor : NexTheme.textSecondary)
+                        .padding(.top, 1)
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 4) {
+                            if group.titleFromLLM {
+                                Image(systemName: "sparkles")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(.accentColor.opacity(0.85))
+                            }
+                            Text(group.title)
+                                .font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(NexTheme.textPrimary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                        }
+                        if group.titleFromLLM, group.tabName != group.title {
+                            Text(group.tabName)
+                                .font(.system(size: 9))
+                                .foregroundColor(NexTheme.textSecondary.opacity(0.7))
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+
+                    Spacer(minLength: 4)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                copyAll()
+            } label: {
+                Image(systemName: copiedAll ? "checkmark" : "doc.on.doc")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(copiedAll ? .green : NexTheme.textSecondary)
+                    .frame(width: 22, height: 22)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(NexTheme.surface.opacity(copiedAll ? 0.8 : 0.5))
+                    )
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help(copiedAll ? "Copiado!" : "Copiar toda a conversa (\(group.count) turnos) para a área de transferência")
+
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("\(group.count)")
+                    .font(.system(size: 9, weight: .medium, design: .monospaced))
+                    .foregroundColor(NexTheme.textSecondary)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(NexTheme.surface)
+                    .cornerRadius(4)
+                Text(group.subtitle)
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundColor(NexTheme.textSecondary.opacity(0.7))
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(isActiveTab ? NexTheme.accentDim.opacity(0.4) : Color.clear)
+        )
+    }
+
+    private func copyAll() {
+        let text = HistoryGroupExporter.export(group: group)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        copiedAll = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            copiedAll = false
+        }
+    }
+}
+
+// MARK: - Group Exporter (consolidated context for analysis)
+
+enum HistoryGroupExporter {
+    /// Serializes a whole conversation group into a single, LLM-friendly
+    /// markdown blob so the user can paste it into ChatGPT/Claude/etc. and
+    /// analyse multiple turns at once.
+    static func export(group: HistoryGroup) -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "dd/MM/yyyy HH:mm:ss"
+
+        // We display newest-first in the UI; for analysis, oldest-first reads
+        // far better, so we reverse here.
+        let entries = group.entries.reversed()
+
+        var out = ""
+        out += "# \(group.title)\n"
+        if group.titleFromLLM, group.tabName != group.title {
+            out += "_Aba: \(group.tabName)_\n"
+        }
+        out += "_Turnos: \(group.count) · Início: \(formatter.string(from: group.firstActivity)) · Fim: \(formatter.string(from: group.lastActivity))_\n\n"
+        out += "---\n\n"
+
+        for (idx, entry) in entries.enumerated() {
+            let n = idx + 1
+            out += "## Turno \(n)/\(group.count) — \(formatter.string(from: entry.timestamp))\n\n"
+
+            out += "### Pedido do usuário\n"
+            out += entry.userInput.trimmingCharacters(in: .whitespacesAndNewlines)
+            out += "\n\n"
+
+            if let plan = entry.plan {
+                let planTitle = plan.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                let planExp = plan.explanation.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !planTitle.isEmpty || !planExp.isEmpty {
+                    out += "### Plano do agente\n"
+                    if !planTitle.isEmpty { out += "**\(planTitle)**\n\n" }
+                    if !planExp.isEmpty { out += planExp + "\n\n" }
+                }
+            }
+
+            if !entry.commands.isEmpty {
+                out += "### Comandos\n"
+                out += "```bash\n"
+                for cmd in entry.commands {
+                    out += cmd + "\n"
+                }
+                out += "```\n\n"
+            }
+
+            if let outputs = entry.stepOutputs, !outputs.isEmpty {
+                out += "### Execução\n"
+                for (i, step) in outputs.enumerated() {
+                    out += "**Passo \(i + 1)** · `$ \(step.command)` · exit \(step.exitCode)\n"
+                    if !step.stdout.isEmpty {
+                        out += "```\n\(step.stdout.trimmingCharacters(in: .whitespacesAndNewlines))\n```\n"
+                    }
+                    if !step.stderr.isEmpty {
+                        out += "_stderr:_\n```\n\(step.stderr.trimmingCharacters(in: .whitespacesAndNewlines))\n```\n"
+                    }
+                    out += "\n"
+                }
+            }
+
+            if let summary = entry.summary?.trimmingCharacters(in: .whitespacesAndNewlines), !summary.isEmpty {
+                out += "### Resultado\n"
+                out += summary + "\n\n"
+            }
+
+            out += "---\n\n"
+        }
+
+        return out
     }
 }
 

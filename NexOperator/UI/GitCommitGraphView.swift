@@ -26,10 +26,12 @@ struct GitCommitGraphView: View {
             LazyVStack(spacing: 0) {
                 ForEach(Array(viewModel.filteredCommits.enumerated()), id: \.element.id) { index, commit in
                     commitRow(commit, row: index)
+                        // Wave 4 · M9: delegate the "should I paginate?" decision
+                        // to the view model so search-active states (where the
+                        // filter list is small and never reaches `count - 10`)
+                        // also keep pulling more history.
                         .onAppear {
-                            if index == viewModel.filteredCommits.count - 10 {
-                                Task { await viewModel.loadMoreCommits() }
-                            }
+                            Task { await viewModel.loadMoreIfNeeded(viewedIndex: index) }
                         }
                 }
             }
@@ -61,6 +63,11 @@ struct GitCommitGraphView: View {
 
     private func commitRow(_ commit: GitCommit, row: Int) -> some View {
         let isSelected = viewModel.selectedCommitId == commit.id
+        // Tint each row with the same color used for its lane in the graph
+        // canvas, so the user can scan vertically and immediately see which
+        // branch a commit belongs to. Zebra striping is kept as a subtle
+        // brightness variation on top of the lane color.
+        let laneColor = GitGraphLine.color(for: commit.lane)
 
         return HStack(spacing: 0) {
             Color.clear
@@ -115,10 +122,25 @@ struct GitCommitGraphView: View {
         }
         .frame(height: rowHeight)
         .background(
-            isSelected
-                ? NexTheme.accentDim
-                : (row % 2 == 0 ? Color.clear : NexTheme.surface.opacity(0.3))
+            ZStack {
+                // Base translucent fill matching the lane color so each
+                // commit row visually inherits its branch identity.
+                laneColor.opacity(isSelected ? 0.28 : (row % 2 == 0 ? 0.08 : 0.14))
+                // Keep the existing accent overlay on top for selection so
+                // the focus state still pops against the colored bg.
+                if isSelected {
+                    NexTheme.accentDim.opacity(0.5)
+                }
+            }
         )
+        .overlay(alignment: .leading) {
+            // Thin colored bar on the left edge. Doubles as a "branch ribbon"
+            // for users who prefer their backgrounds neutral but still want
+            // the at-a-glance branch hint.
+            Rectangle()
+                .fill(laneColor.opacity(isSelected ? 1.0 : 0.6))
+                .frame(width: 2)
+        }
         .contentShape(Rectangle())
         .onTapGesture {
             viewModel.selectedCommitId = commit.id

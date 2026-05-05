@@ -5,6 +5,11 @@ class TabAgentState {
     var agentStatus: String?
     var agentResults: [StepResult] = []
     var agentTask: Task<Void, Never>?
+    /// Wave 2 · C6: tracks the in-flight `submitPromptInline` task so it can be
+    /// cancelled when the tab is closed or the user cancels the operation.
+    /// Without this, closing a tab during inline prompt generation left the task
+    /// alive, eventually publishing into a state nobody owned.
+    var inlineTask: Task<Void, Never>?
 
     var errorMessage: String?
 
@@ -36,11 +41,37 @@ class TabAgentState {
     var streamingText: String?
     var fileAttachments: [FileAttachment] = []
 
+    /// Conversation memory for THIS tab. Survives between user messages so the LLM
+    /// has continuity. Cleared explicitly via `clearConversation()` or when the tab closes.
+    var conversationTurns: [ConversationTurn] = []
+
+    /// Caps how many past turns are passed back to the LLM. Bigger = more context but more tokens.
+    private let maxTurnsForPrompt = 6
+
+    /// Returns the most recent turns (oldest first) up to the configured cap, for prompt injection.
+    var recentTurnsForPrompt: [ConversationTurn] {
+        Array(conversationTurns.suffix(maxTurnsForPrompt))
+    }
+
+    func appendTurn(_ turn: ConversationTurn) {
+        conversationTurns.append(turn)
+        // Hard cap to avoid unbounded memory growth even before prompt-trimming.
+        let hardCap = 50
+        if conversationTurns.count > hardCap {
+            conversationTurns.removeFirst(conversationTurns.count - hardCap)
+        }
+    }
+
+    func clearConversation() {
+        conversationTurns.removeAll()
+    }
+
     func reset() {
         isAgentRunning = false
         agentStatus = nil
         agentResults = []
         agentTask = nil
+        inlineTask = nil
         errorMessage = nil
         pendingAgentMessage = nil
         previewPlan = nil
@@ -65,6 +96,8 @@ class TabAgentState {
     func cancel() {
         agentTask?.cancel()
         agentTask = nil
+        inlineTask?.cancel()
+        inlineTask = nil
         isAgentRunning = false
         agentStatus = "Cancelado"
         endTime = Date()
@@ -74,7 +107,7 @@ class TabAgentState {
         if let request = pendingToolInstall {
             isShowingToolInstall = false
             pendingToolInstall = nil
-            request.continuation.resume(returning: .skip)
+            request.resolver.resolve(.skip)
         }
 
         if let request = pendingSudoRequest {

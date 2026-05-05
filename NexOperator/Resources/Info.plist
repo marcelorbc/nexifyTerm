@@ -39,10 +39,14 @@
 	<string>NexOperator pode precisar do Bluetooth para diagnósticos de dispositivos.</string>
 	<key>NSCalendarsUsageDescription</key>
 	<string>NexOperator pode precisar acessar calendários para operações do sistema.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>NexifyTerm pode precisar acessar a câmera para captura de tela em algumas configurações.</string>
 	<key>NSContactsUsageDescription</key>
 	<string>NexOperator pode precisar acessar contatos para operações do sistema.</string>
 	<key>NSLocationUsageDescription</key>
 	<string>NexOperator pode precisar da localização para configurações de rede e sistema.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>NexifyTerm precisa do microfone para gravar áudio que você opte por capturar.</string>
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>NexOperator pode precisar acessar fotos para operações do sistema.</string>
 	<key>NSPrincipalClass</key>
@@ -68,5 +72,11 @@
 	</array>
 	<key>NSSystemAdministrationUsageDescription</key>
 	<string>NexOperator precisa de privilégios administrativos para gerenciar configurações do sistema.</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUFeedURL</key>
+	<string>https://nexify.ink/downloads/appcast.xml</string>
+	<key>SUPublicEDKey</key>
+	<string>Wmi2NH93JmwEeKPlQgjnqcTKnoFvHfCiEYDvvUS7WeM=</string>
 </dict>
 </plist>

@@ -21,6 +21,7 @@ struct SettingsView: View {
     @State private var cliInstalled: Bool = false
     @State private var cliStatusMessage: String = ""
     @State private var sudoAutoAuthorize: Bool = false
+    @ObservedObject private var updaterService = UpdaterService.shared
 
     private let fieldWidth: CGFloat = 280
 
@@ -37,6 +38,10 @@ struct SettingsView: View {
             integrationContent
                 .tabItem { Label("Integração", systemImage: "puzzlepiece.extension") }
                 .tag("integration")
+
+            personalizationContent
+                .tabItem { Label("Personalização", systemImage: "brain") }
+                .tag("personalization")
 
             skillsContent
                 .tabItem { Label("Skills", systemImage: "sparkle") }
@@ -56,7 +61,10 @@ struct SettingsView: View {
         }
         .frame(width: 680, height: 580)
         .onAppear { load() }
-        .onDisappear { save() }
+        .onDisappear {
+            save()
+            appState.refreshProviderAvailability()
+        }
     }
 
     // MARK: - General
@@ -66,11 +74,16 @@ struct SettingsView: View {
             SettingsSection(
                 title: "Provedor Padrão",
                 icon: "cpu",
-                caption: "Provedor de IA usado por padrão em novos terminais."
+                caption: "Provedor de IA usado por padrão em novos terminais. Somente provedores configurados aparecem."
             ) {
                 LabeledContent("Provedor") {
+                    let availability = ProviderAvailabilityService.shared
+                    let providers = availability.hasAnyProvider
+                        ? availability.availableProviders
+                        : ProviderType.allCases
+
                     Picker("", selection: $defaultProvider) {
-                        ForEach(ProviderType.allCases) { provider in
+                        ForEach(providers) { provider in
                             Text(provider.displayName).tag(provider)
                         }
                     }
@@ -95,6 +108,51 @@ struct SettingsView: View {
                     .pickerStyle(.menu)
                     .frame(width: fieldWidth)
                 }
+            }
+
+            SettingsSection(
+                title: "Atualizações",
+                icon: "arrow.triangle.2.circlepath",
+                caption: "Verifica automaticamente se há novas versões disponíveis."
+            ) {
+                HStack(spacing: 12) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 6) {
+                            Text("NexifyTerm")
+                                .font(.system(size: 12, weight: .semibold))
+                            Text("v\(updaterService.currentVersion)")
+                                .font(.system(size: 11, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Text("(\(updaterService.buildNumber))")
+                                .font(.system(size: 10, design: .monospaced))
+                                .foregroundStyle(.tertiary)
+                        }
+                        if let lastCheck = updaterService.lastUpdateCheck {
+                            Text("Última verificação: \(lastCheck.formatted(.relative(presentation: .named)))")
+                                .font(.system(size: 10))
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    Spacer()
+                    Button("Verificar Agora") {
+                        updaterService.checkForUpdates()
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(!updaterService.canCheckForUpdates)
+                }
+
+                Toggle("Verificar automaticamente", isOn: Binding(
+                    get: { updaterService.automaticallyChecksForUpdates },
+                    set: { updaterService.automaticallyChecksForUpdates = $0 }
+                ))
+                .toggleStyle(.switch)
+
+                Toggle("Baixar atualizações automaticamente", isOn: Binding(
+                    get: { updaterService.automaticallyDownloadsUpdates },
+                    set: { updaterService.automaticallyDownloadsUpdates = $0 }
+                ))
+                .toggleStyle(.switch)
             }
 
             SettingsSection(
@@ -195,17 +253,21 @@ struct SettingsView: View {
     private var providersContent: some View {
         SettingsScroll {
             SettingsSection(
-                title: "Ollama",
+                title: "Ollama (Local — Sem Custo)",
                 icon: "shippingbox",
-                caption: "Ollama precisa estar rodando localmente."
+                caption: "Rode modelos de IA localmente com total privacidade e sem custo. O Ollama precisa estar instalado e rodando."
             ) {
+                OllamaSetupView()
+
+                Divider()
+
                 LabeledContent("Base URL") {
                     TextField("http://localhost:11434", text: $ollamaBaseURL)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: fieldWidth)
                 }
                 LabeledContent("Model") {
-                    TextField("llama3.1", text: $ollamaModel)
+                    TextField("qwen2.5-coder:7b", text: $ollamaModel)
                         .textFieldStyle(.roundedBorder)
                         .frame(width: fieldWidth)
                 }
@@ -410,6 +472,11 @@ struct SettingsView: View {
                 .padding(20)
         }
         .background(NexTheme.bg)
+    }
+
+    private var personalizationContent: some View {
+        PersonalizationSettingsView()
+            .environmentObject(appState)
     }
 
     private var mcpContent: some View {

@@ -5,10 +5,16 @@ struct FileContextMenu: View {
     @EnvironmentObject var appState: AppState
     let item: FileItem
     let provider: FileItemProvider
+    /// All currently selected items (or just `[item]` when nothing is selected).
+    var selectedItems: [FileItem] = []
+    /// Directory where batch outputs (PDF, combined images, zips) are written.
+    var currentDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
     let onRename: () -> Void
     let onAttach: () -> Void
     var onDelete: (() -> Void)?
     var onPermanentDelete: (() -> Void)?
+    /// Called with a user-facing message after a batch action runs (success or error).
+    var onBatchResult: ((String) -> Void)?
 
     private func mergeApps(suggested: [OpenWithApp], system: [OpenWithApp]) -> [OpenWithApp] {
         var seen = Set<String>()
@@ -23,6 +29,27 @@ struct FileContextMenu: View {
 
     private var targetDirectory: String {
         item.isDirectory ? item.url.path : item.url.deletingLastPathComponent().path
+    }
+
+    /// Resolved selection for batch ops — never empty, falls back to `item`.
+    private var effectiveSelection: [FileItem] {
+        selectedItems.isEmpty ? [item] : selectedItems
+    }
+
+    private var imageURLs: [URL] {
+        effectiveSelection.map(\.url).filter { BatchFileActions.isImage($0) }
+    }
+
+    private var pdfOrImageURLs: [URL] {
+        effectiveSelection.map(\.url).filter {
+            BatchFileActions.isImage($0) || BatchFileActions.isPDF($0)
+        }
+    }
+
+    private var canBatch: Bool { effectiveSelection.count > 1 }
+
+    private var mediaKind: MediaKind {
+        item.isDirectory ? .unsupported : MediaKind.of(item.url)
     }
 
     var body: some View {
@@ -82,6 +109,9 @@ struct FileContextMenu: View {
                 Button { appState.addGitTab(directory: item.url.path) } label: {
                     Label("Git", systemImage: "arrow.triangle.branch")
                 }
+                Button { appState.addDiskAnalyzerTab(directory: item.url.path) } label: {
+                    Label("Analisar Espaço em Disco", systemImage: "chart.pie.fill")
+                }
             } else {
                 Button { appState.createTab(directory: targetDirectory) } label: {
                     Label("Terminal", systemImage: "terminal.fill")
@@ -115,11 +145,21 @@ struct FileContextMenu: View {
                 .keyboardShortcut("v", modifiers: .command)
             }
 
-            Button("Anexar ao Prompt") {
+            Button(canBatch ? "Anexar Selecionados ao Prompt" : "Anexar ao Prompt") {
                 onAttach()
             }
 
+            if canBatch || !imageURLs.isEmpty || !pdfOrImageURLs.isEmpty {
+                batchMenu
+            }
+
+            if mediaKind != .unsupported {
+                mediaMenu
+            }
+
             Divider()
+
+            moveToRecentMenu
 
             Button("Renomear") {
                 onRename()
@@ -190,6 +230,264 @@ struct FileContextMenu: View {
                 Label("Excluir Permanentemente", systemImage: "trash.slash")
             }
         }
+    }
+
+    // MARK: - Move to recent
+
+    /// Lists `RecentDirectoriesStore.shared.recents` (excluding the current
+    /// directory and the source's own parent) and moves the effective
+    /// selection there with `provider.moveItems(_:to:)`.
+    @ViewBuilder
+    private var moveToRecentMenu: some View {
+        let store = RecentDirectoriesStore.shared
+        let sourceParents = Set(effectiveSelection.map { $0.url.deletingLastPathComponent().standardizedFileURL.path })
+        let currentDirPath = provider.currentURL.standardizedFileURL.path
+
+        let candidates: [RecentDirectory] = store.recents.filter { rec in
+            let stdPath = (rec.path as NSString).standardizingPath
+            // Esconde destinos sem sentido: o diretório atual e o pai dos
+            // arquivos selecionados (mover pra onde já está = no-op).
+            if stdPath == currentDirPath { return false }
+            if sourceParents.contains(stdPath) { return false }
+            // Garantir que a pasta ainda existe no disco
+            var isDir: ObjCBool = false
+            return FileManager.default.fileExists(atPath: stdPath, isDirectory: &isDir) && isDir.boolValue
+        }
+
+        if candidates.isEmpty {
+            // Mostra item desabilitado pra usuário entender por quê.
+            Menu("Mover para recentes…") {
+                Text("Nenhuma pasta recente disponível")
+                    .font(.system(size: 11))
+                    .foregroundColor(NexTheme.textSecondary)
+            }
+        } else {
+            Menu("Mover para recentes…") {
+                ForEach(candidates.prefix(15)) { rec in
+                    Button {
+                        moveSelectionToRecent(rec)
+                    } label: {
+                        HStack {
+                            Image(systemName: "folder.fill")
+                            Text(rec.name)
+                            Spacer()
+                            Text(shortPath(rec.path))
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .help(rec.path)
+                }
+                Divider()
+                Text("\(effectiveSelection.count) arquivo(s) serão movidos")
+                    .font(.system(size: 10))
+                    .foregroundColor(NexTheme.textSecondary)
+            }
+        }
+    }
+
+    private func moveSelectionToRecent(_ rec: RecentDirectory) {
+        let destination = URL(fileURLWithPath: (rec.path as NSString).standardizingPath)
+        do {
+            try provider.moveItems(effectiveSelection, to: destination)
+            onBatchResult?("\(effectiveSelection.count) item(ns) movido(s) para \(rec.name)")
+        } catch {
+            onBatchResult?("Falha ao mover: \(error.localizedDescription)")
+        }
+    }
+
+    private func shortPath(_ path: String) -> String {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        if path.hasPrefix(home) {
+            return "~" + path.dropFirst(home.count)
+        }
+        return path
+    }
+
+    // MARK: - Batch Menu
+
+    @ViewBuilder
+    private var batchMenu: some View {
+        let count = effectiveSelection.count
+        let label = count > 1 ? "Em Lote (\(count) itens)" : "Ações Avançadas"
+
+        Menu(label) {
+            if !pdfOrImageURLs.isEmpty {
+                Button {
+                    runMergePDF()
+                } label: {
+                    Label("Juntar em PDF", systemImage: "doc.richtext")
+                }
+            }
+
+            if imageURLs.count > 1 {
+                Menu {
+                    Button("Vertical") { runCombineImages(.vertical) }
+                    Button("Horizontal") { runCombineImages(.horizontal) }
+                    Button("Grade") { runCombineImages(.grid) }
+                } label: {
+                    Label("Combinar Imagens", systemImage: "rectangle.3.group")
+                }
+            }
+
+            if !imageURLs.isEmpty {
+                Button {
+                    runAnalyzeWithAI()
+                } label: {
+                    Label("Analisar com IA", systemImage: "sparkles")
+                }
+            }
+
+            if canBatch {
+                Button {
+                    runCompressZip()
+                } label: {
+                    Label("Comprimir em ZIP", systemImage: "doc.zipper")
+                }
+            }
+        }
+    }
+
+    private func runMergePDF() {
+        let urls = pdfOrImageURLs
+        Task.detached {
+            do {
+                let output = try BatchFileActions.mergeToPDF(
+                    urls: urls,
+                    outputDirectory: currentDirectory
+                )
+                await MainActor.run {
+                    onBatchResult?("PDF criado: \(output.lastPathComponent)")
+                    NSWorkspace.shared.activateFileViewerSelecting([output])
+                }
+            } catch {
+                await MainActor.run {
+                    onBatchResult?("Falha ao gerar PDF: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func runCombineImages(_ layout: BatchFileActions.CombineLayout) {
+        let urls = imageURLs
+        Task.detached {
+            do {
+                let output = try BatchFileActions.combineImages(
+                    urls: urls,
+                    layout: layout,
+                    outputDirectory: currentDirectory
+                )
+                await MainActor.run {
+                    onBatchResult?("Imagem combinada: \(output.lastPathComponent)")
+                    NSWorkspace.shared.activateFileViewerSelecting([output])
+                }
+            } catch {
+                await MainActor.run {
+                    onBatchResult?("Falha ao combinar imagens: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func runCompressZip() {
+        let urls = effectiveSelection.map(\.url)
+        let baseName = urls.count == 1
+            ? urls[0].deletingPathExtension().lastPathComponent
+            : "arquivos"
+        Task.detached {
+            do {
+                let output = try BatchFileActions.compressToZip(
+                    urls: urls,
+                    outputDirectory: currentDirectory,
+                    baseName: baseName
+                )
+                await MainActor.run {
+                    onBatchResult?("ZIP criado: \(output.lastPathComponent)")
+                    NSWorkspace.shared.activateFileViewerSelecting([output])
+                }
+            } catch {
+                await MainActor.run {
+                    onBatchResult?("Falha ao criar ZIP: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    // MARK: - Media Menu (Áudio / Transcrição)
+
+    @ViewBuilder
+    private var mediaMenu: some View {
+        Menu("Mídia") {
+            if mediaKind == .video {
+                Button {
+                    runExtractAudio()
+                } label: {
+                    Label("Separar Áudio do Vídeo", systemImage: "waveform.path")
+                }
+            }
+
+            Button {
+                runFullTranscription()
+            } label: {
+                Label("Gerar Transcrição Completa", systemImage: "text.bubble")
+            }
+        }
+    }
+
+    private func runExtractAudio() {
+        let url = item.url
+        onBatchResult?("Extraindo áudio de \(url.lastPathComponent)...")
+        Task {
+            do {
+                let output = try await MediaTranscriptionPipeline.extractAudioOnly(for: url) { _ in }
+                await MainActor.run {
+                    onBatchResult?("Áudio salvo: \(output.lastPathComponent)")
+                    NSWorkspace.shared.activateFileViewerSelecting([output])
+                }
+            } catch {
+                await MainActor.run {
+                    onBatchResult?("Falha ao extrair áudio: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func runFullTranscription() {
+        let url = item.url
+        let apiKey = ConfigStore.shared.openAIAPIKey
+        guard !apiKey.isEmpty else {
+            onBatchResult?("Chave da OpenAI não configurada. Defina em Configurações → IA.")
+            return
+        }
+
+        onBatchResult?("Iniciando transcrição de \(url.lastPathComponent)... (pode demorar alguns minutos)")
+        Task {
+            do {
+                let output = try await MediaTranscriptionPipeline.runFullTranscription(for: url) { step in
+                    NexLog.ai.info("Transcrição: \(step.description, privacy: .public)")
+                }
+                await MainActor.run {
+                    onBatchResult?("Transcrição salva: \(output.lastPathComponent)")
+                    NSWorkspace.shared.activateFileViewerSelecting([output])
+                }
+            } catch {
+                await MainActor.run {
+                    onBatchResult?("Falha na transcrição: \(error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    private func runAnalyzeWithAI() {
+        let urls = imageURLs
+        let attachments = urls.compactMap { FileAttachmentExtractor.extract(from: $0) }
+        guard !attachments.isEmpty else {
+            onBatchResult?("Nenhuma imagem válida para analisar.")
+            return
+        }
+        let prompt = attachments.count == 1
+            ? "Analise esta imagem e descreva o conteúdo, detalhes técnicos e qualquer informação útil."
+            : "Analise estas \(attachments.count) imagens. Descreva cada uma e indique semelhanças/diferenças relevantes."
+        appState.startAgentExecution(prompt, attachments: attachments)
     }
 
     private func showQuickLook(url: URL) {

@@ -10,6 +10,11 @@ class FileSearchEngine: ObservableObject {
     private var spotlightQuery: NSMetadataQuery?
     private var fallbackTask: Task<Void, Never>?
     private var debounceTask: Task<Void, Never>?
+    /// Wave 2 · A6: tokens returned by `addObserver(forName:...usingBlock:)` so we
+    /// can actually remove them later. `removeObserver(self, name:object:)` does
+    /// **not** work for block-based observers — without storing the tokens, the
+    /// observers were leaking and accumulating across queries.
+    private var spotlightObservers: [NSObjectProtocol] = []
 
     struct FileSearchResult: Identifiable, Hashable {
         let id: String
@@ -175,7 +180,7 @@ class FileSearchEngine: ObservableObject {
             NSSortDescriptor(key: "kMDItemFSName", ascending: true)
         ]
 
-        NotificationCenter.default.addObserver(
+        let finishToken = NotificationCenter.default.addObserver(
             forName: .NSMetadataQueryDidFinishGathering,
             object: mdQuery,
             queue: .main
@@ -183,7 +188,7 @@ class FileSearchEngine: ObservableObject {
             self?.handleSpotlightResults(notification)
         }
 
-        NotificationCenter.default.addObserver(
+        let progressToken = NotificationCenter.default.addObserver(
             forName: .NSMetadataQueryGatheringProgress,
             object: mdQuery,
             queue: .main
@@ -191,6 +196,7 @@ class FileSearchEngine: ObservableObject {
             self?.handleSpotlightResults(notification)
         }
 
+        spotlightObservers = [finishToken, progressToken]
         spotlightQuery = mdQuery
         mdQuery.start()
 
@@ -269,8 +275,10 @@ class FileSearchEngine: ObservableObject {
         spotlightQuery = nil
         fallbackTask?.cancel()
         fallbackTask = nil
-        NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryDidFinishGathering, object: nil)
-        NotificationCenter.default.removeObserver(self, name: .NSMetadataQueryGatheringProgress, object: nil)
+        for token in spotlightObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+        spotlightObservers.removeAll()
     }
 
     func cancel() {
@@ -284,6 +292,16 @@ class FileSearchEngine: ObservableObject {
         cancel()
         results = []
         searchText = ""
+    }
+
+    deinit {
+        // Wave 2 · A6: safety net — if the engine is deallocated while observers
+        // are still registered, they would otherwise outlive the instance and
+        // potentially crash on next callback. removeObserver(token) is safe to
+        // call from deinit (no @MainActor hop needed).
+        for token in spotlightObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
     }
 }
 

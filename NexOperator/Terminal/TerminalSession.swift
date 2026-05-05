@@ -37,6 +37,59 @@ class TerminalSession {
         if let observer = fontObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+        // Safety net: if destroySession() wasn't called explicitly, still terminate the
+        // shell process to avoid orphan PTYs/PIDs. terminate() is idempotent in SwiftTerm.
+        if hasStarted {
+            terminalView.terminate()
+        }
+    }
+
+    /// Terminates the underlying shell process (SIGTERM via SwiftTerm). Safe to call
+    /// multiple times; only sends the signal if the process is alive.
+    /// Should be called by `TerminalSessionManager.destroySession(for:)` before the
+    /// session is dropped from the registry.
+    func terminate() {
+        guard hasStarted else { return }
+        let pid = terminalView.process.shellPid
+        terminalView.terminate()
+        hasStarted = false
+        NexLog.terminal.info("Terminated terminal session \(self.id, privacy: .public) (pid=\(pid, privacy: .public))")
+    }
+
+    /// Visually echoes a command/output line in the terminal display **without**
+    /// sending it to the underlying shell. Used by the agent to surface what is
+    /// being executed in the parallel `Process` without duplicating side effects.
+    /// - Note: text is fed verbatim; pass ANSI escapes (e.g., colors) if desired.
+    func echoText(_ text: String) {
+        if Thread.isMainThread {
+            terminalView.feed(text: text)
+        } else {
+            DispatchQueue.main.async { [weak self] in
+                self?.terminalView.feed(text: text)
+            }
+        }
+    }
+
+    /// Visually echoes an agent command line as if the user had typed and run it,
+    /// but without actually sending anything to the shell. Used to surface agent
+    /// activity in the terminal while the real execution happens via `CommandExecutor`.
+    func echoAgentCommand(_ command: String) {
+        let line = "\r\n\u{1B}[2m\u{1B}[36m▸ agent\u{1B}[0m \u{1B}[1m$\u{1B}[0m \(command)\r\n"
+        echoText(line)
+    }
+
+    /// Echoes the captured output of an agent command into the terminal display.
+    /// Output is normalized to use `\r\n` line endings (required by the emulator).
+    func echoAgentOutput(_ output: String, exitCode: Int32) {
+        var normalized = output.replacingOccurrences(of: "\r\n", with: "\n")
+        normalized = normalized.replacingOccurrences(of: "\n", with: "\r\n")
+        if !normalized.isEmpty, !normalized.hasSuffix("\r\n") {
+            normalized += "\r\n"
+        }
+        let footer = exitCode == 0
+            ? "\u{1B}[2m▸ agent ok (exit 0)\u{1B}[0m\r\n"
+            : "\u{1B}[2m\u{1B}[31m▸ agent exit \(exitCode)\u{1B}[0m\r\n"
+        echoText(normalized + footer)
     }
 
     func startIfNeeded() {

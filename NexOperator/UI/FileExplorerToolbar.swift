@@ -3,11 +3,17 @@ import SwiftUI
 struct FileExplorerPathBar: View {
     let url: URL
     let onNavigate: (URL) -> Void
+    /// Optional callback fired when files are dropped onto a breadcrumb
+    /// segment. Returns `true` if the drop was accepted. Receives the
+    /// destination directory + the dropped item providers — caller is
+    /// responsible for resolving the URLs and moving them.
+    var onDropToSegment: ((URL, [NSItemProvider]) -> Bool)? = nil
 
     @State private var isEditing = false
     @State private var editText = ""
     @State private var suggestions: [URL] = []
     @State private var selectedSuggestionIndex = -1
+    @State private var dropTargetSegmentURL: URL? = nil
     @FocusState private var textFieldFocused: Bool
 
     private var components: [(name: String, url: URL)] {
@@ -50,19 +56,7 @@ struct FileExplorerPathBar: View {
                                 .font(.system(size: 8))
                                 .foregroundColor(NexTheme.textSecondary.opacity(0.5))
                         }
-                        Button {
-                            onNavigate(component.url)
-                        } label: {
-                            Text(component.name)
-                                .font(.system(size: 11, weight: component.url == url ? .semibold : .regular, design: .monospaced))
-                                .foregroundColor(component.url == url ? NexTheme.textPrimary : NexTheme.textSecondary)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 4)
-                                .background(component.url == url ? NexTheme.surfaceHover : Color.clear)
-                                .cornerRadius(4)
-                                .contentShape(Rectangle())
-                        }
-                        .buttonStyle(.plain)
+                        breadcrumbSegment(component: component)
                     }
                 }
                 .padding(.horizontal, 8)
@@ -94,6 +88,65 @@ struct FileExplorerPathBar: View {
             .buttonStyle(.plain)
             .help("Editar path (⌘L)")
             .padding(.trailing, 4)
+        }
+    }
+
+    /// One breadcrumb chip — clickable for navigation, drop target for
+    /// moving files into that ancestor directory. Highlights in accent
+    /// color while a drag is hovering.
+    @ViewBuilder
+    private func breadcrumbSegment(component: (name: String, url: URL)) -> some View {
+        let isCurrent = component.url == url
+        let isDropTarget = dropTargetSegmentURL == component.url
+        // Drop só faz sentido se houver callback E se o segmento não for o
+        // diretório atual (mover pra si mesmo é no-op).
+        let acceptsDrop = onDropToSegment != nil && !isCurrent
+
+        let baseButton = Button {
+            onNavigate(component.url)
+        } label: {
+            Text(component.name)
+                .font(.system(size: 11, weight: isCurrent ? .semibold : .regular, design: .monospaced))
+                .foregroundColor(
+                    isDropTarget ? .white :
+                        (isCurrent ? NexTheme.textPrimary : NexTheme.textSecondary)
+                )
+                .padding(.horizontal, 6)
+                .padding(.vertical, 4)
+                .background(
+                    isDropTarget ? NexTheme.accent
+                        : (isCurrent ? NexTheme.surfaceHover : Color.clear)
+                )
+                .cornerRadius(4)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 4)
+                        .stroke(
+                            isDropTarget ? NexTheme.accent : Color.clear,
+                            lineWidth: isDropTarget ? 1 : 0
+                        )
+                )
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(isDropTarget
+              ? "Soltar para mover para \(component.url.path)"
+              : component.url.path)
+
+        if acceptsDrop {
+            baseButton.onDrop(
+                of: [.fileURL],
+                isTargeted: Binding(
+                    get: { dropTargetSegmentURL == component.url },
+                    set: { hovering in
+                        dropTargetSegmentURL = hovering ? component.url : nil
+                    }
+                )
+            ) { providers in
+                dropTargetSegmentURL = nil
+                return onDropToSegment?(component.url, providers) ?? false
+            }
+        } else {
+            baseButton
         }
     }
 
@@ -374,6 +427,7 @@ struct FileExplorerToolbar: View {
     let onToggleHidden: () -> Void
     let onAttachSelected: () -> Void
     let onRefresh: () -> Void
+    let onRecord: () -> Void
     let selectedCount: Int
 
     private var isCurrentDirGitRepo: Bool {
@@ -392,6 +446,7 @@ struct FileExplorerToolbar: View {
 
             toolbarButton(icon: "folder.badge.plus", action: onNewFolder, help: "Nova pasta")
             toolbarButton(icon: "terminal.fill", action: onTerminalHere, help: "Terminal aqui")
+            toolbarButton(icon: "record.circle", action: onRecord, help: "Gravar áudio/tela aqui")
             gitToolbarButton
 
             Divider().frame(height: 16).padding(.horizontal, 2)

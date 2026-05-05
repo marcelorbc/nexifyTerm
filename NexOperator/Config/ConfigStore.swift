@@ -29,6 +29,13 @@ class ConfigStore: ObservableObject {
         static let hotKeyModifiers = "hotKeyModifiers"
         static let hotKeyHideOnFocusLost = "hotKeyHideOnFocusLost"
         static let sudoAutoAuthorize = "sudoAutoAuthorize"
+        static let diskAnalyzerSkipDevDirs = "diskAnalyzerSkipDevDirs"
+        static let customInstructions = "customInstructions"
+        static let personalityStyle = "personalityStyle"
+        static let memoryEnabled = "memoryEnabled"
+        static let memoryAutoCapture = "memoryAutoCapture"
+        static let referenceChatHistory = "referenceChatHistory"
+        static let systemProfileEnabled = "systemProfileEnabled"
     }
 
     var defaultProvider: ProviderType {
@@ -213,6 +220,85 @@ class ConfigStore: ObservableObject {
         get { store.getConfig(Keys.sudoAutoAuthorize) == "true" }
         set {
             store.setConfig(Keys.sudoAutoAuthorize, value: newValue ? "true" : "false")
+            objectWillChange.send()
+        }
+    }
+
+    // MARK: - Disk Analyzer
+
+    /// Quando `true` (default), pula `node_modules`, `.git`, `Pods`, build dirs etc
+    /// durante a análise de disco. Drasticamente acelera workspaces de dev.
+    var diskAnalyzerSkipDevDirs: Bool {
+        get { store.getConfig(Keys.diskAnalyzerSkipDevDirs) != "false" }
+        set {
+            store.setConfig(Keys.diskAnalyzerSkipDevDirs, value: newValue ? "true" : "false")
+            objectWillChange.send()
+        }
+    }
+
+    // MARK: - Personalization (memory + custom instructions + style)
+
+    /// Free-form instructions the user wants the agent to consider on EVERY interaction.
+    /// Equivalent to ChatGPT's "Custom Instructions".
+    var customInstructions: String {
+        get { store.getConfig(Keys.customInstructions) ?? "" }
+        set {
+            store.setConfig(Keys.customInstructions, value: newValue)
+            objectWillChange.send()
+        }
+    }
+
+    /// Tone / style baseline. Combined with memories and custom instructions.
+    var personalityStyle: PersonalityStyle {
+        get {
+            guard let raw = store.getConfig(Keys.personalityStyle),
+                  let style = PersonalityStyle(rawValue: raw) else {
+                return .direct
+            }
+            return style
+        }
+        set {
+            store.setConfig(Keys.personalityStyle, value: newValue.rawValue)
+            objectWillChange.send()
+        }
+    }
+
+    /// Master toggle: when off, no memory is injected into prompts.
+    var memoryEnabled: Bool {
+        get { store.getConfig(Keys.memoryEnabled) != "false" }
+        set {
+            store.setConfig(Keys.memoryEnabled, value: newValue ? "true" : "false")
+            objectWillChange.send()
+        }
+    }
+
+    /// Whether the LLM is allowed to auto-capture new memories from conversation.
+    /// User can disable to keep memories purely manual.
+    var memoryAutoCapture: Bool {
+        get { store.getConfig(Keys.memoryAutoCapture) != "false" }
+        set {
+            store.setConfig(Keys.memoryAutoCapture, value: newValue ? "true" : "false")
+            objectWillChange.send()
+        }
+    }
+
+    /// Whether to surface tab conversation history (recent turns) to the LLM.
+    /// Equivalent to ChatGPT's "Reference chat history" toggle.
+    var referenceChatHistory: Bool {
+        get { store.getConfig(Keys.referenceChatHistory) != "false" }
+        set {
+            store.setConfig(Keys.referenceChatHistory, value: newValue ? "true" : "false")
+            objectWillChange.send()
+        }
+    }
+
+    /// Whether the agent prompt receives the cached `SystemProfile` (hardware,
+    /// OS, installed tools). When off, the LLM will discover availability via
+    /// commands at runtime instead.
+    var systemProfileEnabled: Bool {
+        get { store.getConfig(Keys.systemProfileEnabled) != "false" }
+        set {
+            store.setConfig(Keys.systemProfileEnabled, value: newValue ? "true" : "false")
             objectWillChange.send()
         }
     }

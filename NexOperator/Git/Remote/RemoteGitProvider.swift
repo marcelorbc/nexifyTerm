@@ -12,8 +12,27 @@ protocol RemoteGitProvider {
 }
 
 extension RemoteGitProvider {
-    func repositories(query: String? = nil, page: Int = 1, perPage: Int = 30) async throws -> [RemoteRepository] {
+    func repositories(query: String? = nil, page: Int = 1, perPage: Int = 100) async throws -> [RemoteRepository] {
         try await repositories(query: query, page: page, perPage: perPage)
+    }
+
+    /// Pages through repositories until the provider stops returning a full
+    /// page (or `pageCap` is hit). Lets the UI show all 200+ repos at once
+    /// instead of being silently capped at 30.
+    func allRepositories(
+        query: String? = nil,
+        perPage: Int = 100,
+        pageCap: Int = 20
+    ) async throws -> [RemoteRepository] {
+        var all: [RemoteRepository] = []
+        var page = 1
+        while page <= pageCap {
+            let chunk = try await repositories(query: query, page: page, perPage: perPage)
+            all.append(contentsOf: chunk)
+            if chunk.count < perPage { break }
+            page += 1
+        }
+        return all
     }
 
     func fileTree(repo: String, path: String = "", ref: String = "main") async throws -> [RemoteFileNode] {

@@ -39,6 +39,8 @@ struct InputBarView: View {
             return "Pergunte algo à IA ou digite um comando..."
         case .mosaic:
             return "Pergunte algo à IA ou digite um comando..."
+        case .diskAnalyzer:
+            return "Pergunte sobre o uso de disco ou peça sugestões de limpeza..."
         }
     }
 
@@ -216,6 +218,12 @@ struct InputBarView: View {
     @ViewBuilder
     private var inputToolbar: some View {
         if let tab = appState.activeTab {
+            let availability = ProviderAvailabilityService.shared
+            let providers = availability.availableProviders.isEmpty
+                ? ProviderType.allCases
+                : availability.availableProviders
+            let models = availability.availableModels(for: tab.provider)
+
             HStack(spacing: 4) {
                 Button { openFilePicker() } label: {
                     Image(systemName: !attachments.isEmpty ? "plus.circle.fill" : "plus")
@@ -261,30 +269,36 @@ struct InputBarView: View {
                         get: { tab.provider },
                         set: { newVal in
                             appState.activeTab?.provider = newVal
-                            appState.activeTab?.model = appState.configStore.modelForProvider(newVal)
+                            let newModels = ProviderAvailabilityService.shared.availableModels(for: newVal)
+                            let currentModel = appState.configStore.modelForProvider(newVal)
+                            appState.activeTab?.model = newModels.contains(currentModel)
+                                ? currentModel
+                                : (newModels.first ?? newVal.defaultModel)
                             appState.configStore.defaultProvider = newVal
                         }
                     ),
-                    options: ProviderType.allCases,
+                    options: providers,
                     label: { $0.displayName }
                 )
 
-                chipPicker(
-                    icon: nil,
-                    selection: Binding(
-                        get: { tab.model },
-                        set: { newVal in
-                            appState.activeTab?.model = newVal
-                            switch tab.provider {
-                            case .ollama: appState.configStore.ollamaModel = newVal
-                            case .openAI: appState.configStore.openAIModel = newVal
-                            case .gemini: appState.configStore.geminiModel = newVal
+                if !models.isEmpty {
+                    chipPicker(
+                        icon: nil,
+                        selection: Binding(
+                            get: { tab.model },
+                            set: { newVal in
+                                appState.activeTab?.model = newVal
+                                switch tab.provider {
+                                case .ollama: appState.configStore.ollamaModel = newVal
+                                case .openAI: appState.configStore.openAIModel = newVal
+                                case .gemini: appState.configStore.geminiModel = newVal
+                                }
                             }
-                        }
-                    ),
-                    options: tab.provider.availableModels,
-                    label: { $0 }
-                )
+                        ),
+                        options: models,
+                        label: { $0 }
+                    )
+                }
 
                 chipPicker(
                     icon: "checkmark.shield",
@@ -299,9 +313,24 @@ struct InputBarView: View {
                     label: { $0.displayName }
                 )
 
+                ContextSizeIndicator(breakdown: contextBreakdown(for: tab))
+
                 intentBadge
             }
         }
+    }
+
+    private func contextBreakdown(for tab: TerminalTab) -> ContextEstimator.Breakdown {
+        let caps = ProviderType.capabilities(for: tab.model)
+        let turns = appState.agentState(for: tab.id).recentTurnsForPrompt
+        return ContextEstimator.breakdown(
+            tabMode: tab.tabMode,
+            contextWindow: caps.contextWindow,
+            userInput: inputText,
+            attachments: attachments,
+            turns: turns,
+            terminalContextChars: 0
+        )
     }
 
     private func chipPicker<T: Hashable>(
@@ -625,6 +654,9 @@ struct InputBarView: View {
             RoundedRectangle(cornerRadius: 6)
                 .stroke(chipBorder, lineWidth: 0.5)
         )
+        .onDrag {
+            NSItemProvider(object: URL(fileURLWithPath: att.originalPath) as NSURL)
+        }
     }
 
     private func removeAttachment(_ att: FileAttachment) {
