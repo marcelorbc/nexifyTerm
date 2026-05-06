@@ -6,6 +6,7 @@ enum TabMode: String {
     case mosaic
     case git
     case diskAnalyzer
+    case whatsapp
 }
 
 struct TerminalTab: Identifiable, Equatable {
@@ -46,6 +47,7 @@ struct TerminalTab: Identifiable, Equatable {
     var isMosaic: Bool { tabMode == .mosaic }
     var isGit: Bool { tabMode == .git }
     var isDiskAnalyzer: Bool { tabMode == .diskAnalyzer }
+    var isWhatsApp: Bool { tabMode == .whatsapp }
 
     var tabIcon: String {
         switch tabMode {
@@ -54,6 +56,7 @@ struct TerminalTab: Identifiable, Equatable {
         case .mosaic: return "rectangle.split.2x2.fill"
         case .git: return "arrow.triangle.branch"
         case .diskAnalyzer: return "chart.pie.fill"
+        case .whatsapp: return "message.fill"
         }
     }
 

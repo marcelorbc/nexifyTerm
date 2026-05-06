@@ -52,9 +52,18 @@ class AppState: ObservableObject {
         startMCPServers()
         warmSystemProfile()
         refreshProviderAvailability()
+        bootWhatsAppIfEnabled()
         if !history.isEmpty {
             HistoryAnalyzer.shared.scheduleAnalysis(entries: history, delay: 5.0)
         }
+    }
+
+    /// Boots the WhatsApp bridge process if the user has at least one paired
+    /// session or has explicitly enabled the integration in Settings. We avoid
+    /// spawning the Node child for users that never opened the feature.
+    private func bootWhatsAppIfEnabled() {
+        guard configStore.whatsappEnabled else { return }
+        Task { await WhatsAppStore.shared.boot() }
     }
 
     func refreshProviderAvailability() {
@@ -331,6 +340,33 @@ class AppState: ObservableObject {
         notifyTabStateChanged()
     }
 
+    func addWhatsAppTab() {
+        // If a WhatsApp tab is already open, focus it instead of stacking
+        // duplicates -- the underlying view shows all sessions/chats anyway.
+        if let existing = tabs.first(where: { $0.tabMode == .whatsapp }) {
+            activeTabId = existing.id
+            notifyTabStateChanged()
+            return
+        }
+        let tab = TerminalTab(
+            title: "WhatsApp",
+            currentDirectory: configStore.defaultDirectory,
+            provider: configStore.defaultProvider,
+            model: configStore.modelForProvider(configStore.defaultProvider),
+            approvalMode: configStore.defaultApprovalMode,
+            tabMode: .whatsapp
+        )
+        tabs.append(tab)
+        activeTabId = tab.id
+        // The tab itself shows an enable/install prompt when WhatsApp hasn't
+        // been activated yet, so we only kick off boot if the user already
+        // turned it on in Settings.
+        if configStore.whatsappEnabled {
+            Task { await WhatsAppStore.shared.boot() }
+        }
+        notifyTabStateChanged()
+    }
+
     // MARK: - Mosaic focus (Wave 6 · A9)
 
     /// Sets the focused pane for a mosaic tab. Called by `MosaicPaneView` on tap
@@ -580,6 +616,8 @@ class AppState: ObservableObject {
             // empty string when the user is operating in explorer mode.
             let ctx = ExplorerContextBuilder.build(directory: tab.currentDirectory)
             return ExplorerContextBuilder.formatForPrompt(ctx)
+        case .whatsapp:
+            return WhatsAppContextBuilder.formatForPrompt()
         default:
             return ""
         }

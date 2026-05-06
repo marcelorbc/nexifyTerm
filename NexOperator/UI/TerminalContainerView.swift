@@ -36,6 +36,11 @@ struct TerminalContainerView: View {
                 DiskAnalyzerView(directory: tab.currentDirectory)
                     .environmentObject(appState)
                     .id(tabId)
+            case .whatsapp:
+                WhatsAppTabView()
+                    .environmentObject(appState)
+                    .environmentObject(WhatsAppStore.shared)
+                    .id(tabId)
             }
         } else {
             VStack(spacing: 12) {

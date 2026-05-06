@@ -51,6 +51,10 @@ struct SettingsView: View {
                 .tabItem { Label("MCP Servers", systemImage: "server.rack") }
                 .tag("mcp")
 
+            whatsappContent
+                .tabItem { Label("WhatsApp", systemImage: "message.fill") }
+                .tag("whatsapp")
+
             providersContent
                 .tabItem { Label("Provedores IA", systemImage: "cpu") }
                 .tag("providers")
@@ -486,6 +490,11 @@ struct SettingsView: View {
                 .padding(20)
         }
         .background(NexTheme.bg)
+    }
+
+    private var whatsappContent: some View {
+        WhatsAppSettingsSection()
+            .environmentObject(appState)
     }
 
     private var shortcutsContent: some View {

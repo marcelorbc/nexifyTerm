@@ -59,9 +59,10 @@ enum ContextEstimator {
     /// Update these when the system prompt grows substantially.
     static func systemPromptTokens(for tabMode: TabMode) -> Int {
         switch tabMode {
-        case .terminal, .mosaic:      return 1_400
-        case .git:                    return 1_200
+        case .terminal, .mosaic:       return 1_400
+        case .git:                     return 1_200
         case .explorer, .diskAnalyzer: return 900
+        case .whatsapp:                return 1_000
         }
     }
 

@@ -10,4 +10,5 @@ enum NexLog {
     static let safety = os.Logger(subsystem: subsystem, category: "safety")
     static let config = os.Logger(subsystem: subsystem, category: "config")
     static let git = os.Logger(subsystem: subsystem, category: "git")
+    static let whatsapp = os.Logger(subsystem: subsystem, category: "whatsapp")
 }

@@ -219,6 +219,11 @@ struct TerminalTabsView: View {
             } label: {
                 Label("Disk Analyzer", systemImage: "chart.pie.fill")
             }
+            Button {
+                appState.addWhatsAppTab()
+            } label: {
+                Label("WhatsApp", systemImage: "message.fill")
+            }
 
             Divider()
 

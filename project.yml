@@ -23,8 +23,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nexia.nexifyterm.widget
         PRODUCT_NAME: NexifyTermWidget
-        MARKETING_VERSION: "0.1.7"
-        CURRENT_PROJECT_VERSION: "7"
+        MARKETING_VERSION: "0.1.13"
+        CURRENT_PROJECT_VERSION: "12"
         SWIFT_VERSION: "5"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks @executable_path/../../../../Frameworks"
@@ -37,6 +37,27 @@ targets:
     type: application
     platform: macOS
     sources: [NexOperator]
+    postBuildScripts:
+      - name: "Bundle WhatsApp Bridge Source"
+        # Copies the bridge sources (TypeScript only) into the .app bundle so
+        # the in-app installer can lay them down in Application Support and run
+        # `npm install` locally on first activation. node_modules and dist are
+        # produced at runtime; never ship them.
+        script: |
+          set -e
+          SRC="$SRCROOT/backend/whatsapp"
+          DEST="$CONFIGURATION_BUILD_DIR/$PRODUCT_NAME.app/Contents/Resources/whatsapp-bridge"
+          mkdir -p "$DEST"
+          rsync -a --delete \
+            --exclude node_modules \
+            --exclude dist \
+            --exclude data \
+            --exclude test-data \
+            --exclude '*.log' \
+            --exclude '.DS_Store' \
+            "$SRC/" "$DEST/"
+        outputFiles:
+          - $(CONFIGURATION_BUILD_DIR)/$(PRODUCT_NAME).app/Contents/Resources/whatsapp-bridge/package.json
     dependencies:
       - package: SwiftTerm
       - package: Sparkle
@@ -45,8 +66,8 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.nexia.nexifyterm
         PRODUCT_NAME: NexifyTerm
-        MARKETING_VERSION: "0.1.7"
-        CURRENT_PROJECT_VERSION: "7"
+        MARKETING_VERSION: "0.1.13"
+        CURRENT_PROJECT_VERSION: "12"
         SWIFT_VERSION: "5"
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon

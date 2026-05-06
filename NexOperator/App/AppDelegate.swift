@@ -167,6 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             case .mosaic:       icon = "◫"
             case .git:          icon = "⎇"
             case .diskAnalyzer: icon = "💿"
+            case .whatsapp:     icon = "💬"
             }
 
             let prefix = tab.id == state.activeTabId ? "● " : "  "

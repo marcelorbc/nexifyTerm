@@ -36,6 +36,7 @@ class ConfigStore: ObservableObject {
         static let memoryAutoCapture = "memoryAutoCapture"
         static let referenceChatHistory = "referenceChatHistory"
         static let systemProfileEnabled = "systemProfileEnabled"
+        static let whatsappEnabled = "whatsappEnabled"
     }
 
     var defaultProvider: ProviderType {
@@ -299,6 +300,16 @@ class ConfigStore: ObservableObject {
         get { store.getConfig(Keys.systemProfileEnabled) != "false" }
         set {
             store.setConfig(Keys.systemProfileEnabled, value: newValue ? "true" : "false")
+            objectWillChange.send()
+        }
+    }
+
+    /// Whether the WhatsApp integration (Node bridge + UI tab) is enabled.
+    /// Off by default so we don't spawn the bridge for users who never opt in.
+    var whatsappEnabled: Bool {
+        get { store.getConfig(Keys.whatsappEnabled) == "true" }
+        set {
+            store.setConfig(Keys.whatsappEnabled, value: newValue ? "true" : "false")
             objectWillChange.send()
         }
     }

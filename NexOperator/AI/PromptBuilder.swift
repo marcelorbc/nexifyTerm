@@ -964,9 +964,43 @@ struct PromptBuilder {
                 ["role": "system", "content": personaPrefix + buildExplorerSystemPrompt()],
                 ["role": "user", "content": buildExplorerUserPrompt(from: input, explorerContext: contextExtra, personalization: personalization)]
             ]
+        case .whatsapp:
+            return [
+                ["role": "system", "content": personaPrefix + buildWhatsAppSystemPrompt()],
+                ["role": "user", "content": buildWhatsAppUserPrompt(from: input, whatsappContext: contextExtra)]
+            ]
         default:
             return buildMessages(from: input)
         }
+    }
+
+    private static func buildWhatsAppSystemPrompt() -> String {
+        return """
+        Você é um assistente integrado ao NexifyTerm com acesso ao contexto de uma conversa de WhatsApp do usuário.
+
+        Capacidades:
+        - Resumir conversas, listar pendências, decisões e perguntas em aberto.
+        - Sugerir respostas (em português, tom adequado ao histórico).
+        - Extrair dados estruturados (datas, valores, links, contatos).
+        - Identificar mídia mencionada e descrever brevemente.
+
+        Regras:
+        - NÃO envie mensagens automaticamente — apenas sugira textos prontos para o usuário enviar.
+        - NÃO invente fatos: use apenas o que aparece no histórico fornecido.
+        - Responda em português, de forma concisa, com foco em ação.
+        - Quando não houver mensagens carregadas, peça ao usuário para abrir a conversa primeiro.
+
+        Formato de saída: prosa direta. Quando listar itens, use bullets curtos.
+        """
+    }
+
+    private static func buildWhatsAppUserPrompt(from input: AgentInput, whatsappContext: String) -> String {
+        var prompt = ""
+        if !whatsappContext.isEmpty {
+            prompt += "=== CONTEXTO WHATSAPP ===\n\(whatsappContext)\n=== FIM CONTEXTO ===\n\n"
+        }
+        prompt += "Pedido do usuário: \(input.userMessage)"
+        return prompt
     }
 
     static func buildMCPResultsContext(results: [MCPToolResult]) -> String {

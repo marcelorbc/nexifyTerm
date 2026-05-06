@@ -41,6 +41,8 @@ struct InputBarView: View {
             return "Pergunte algo à IA ou digite um comando..."
         case .diskAnalyzer:
             return "Pergunte sobre o uso de disco ou peça sugestões de limpeza..."
+        case .whatsapp:
+            return "Ex: \"resume esta conversa\", \"sugira uma resposta\"..."
         }
     }
 
