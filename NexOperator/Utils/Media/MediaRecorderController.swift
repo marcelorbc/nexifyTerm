@@ -44,6 +44,33 @@ final class MediaRecorderController: ObservableObject {
 
     // MARK: - Public API
 
+    /// Detecta combinações de configuração que historicamente sabotam a
+    /// gravação no macOS — em particular: usar mic Bluetooth com captura de
+    /// áudio do sistema (AirPods força A2DP→HFP, que bypassa o mixer interno
+    /// e o ScreenCaptureKit não recebe samples). Retorna texto pronto para
+    /// mostrar como banner/alert; `nil` quando não há risco aparente.
+    static func preflightAdvisory(mode: RecordingMode, micID: String?) -> String? {
+        guard mode.needsSystemAudio else { return nil }
+
+        // Caso 1: o mic escolhido pelo usuário é um dispositivo Bluetooth.
+        if mode.needsMic, let id = micID, let device = AudioInputDevices.device(withID: id),
+           AudioRouteInspector.isBluetoothMic(device) {
+            return "O microfone \"\(device.localizedName)\" é Bluetooth. Ativá-lo durante a gravação força o macOS a trocar o áudio para modo HFP/SCO, o que costuma BLOQUEAR a captura do áudio do sistema (você gravaria só o microfone). Recomendado: usar o microfone interno do Mac."
+        }
+
+        // Caso 2: o output ativo do sistema é Bluetooth/AirPlay (que pode
+        // bypassar o mixer interno mesmo sem mic Bluetooth).
+        if let route = AudioRouteInspector.currentRoute() {
+            if route.outputIsBluetooth {
+                return "O output de áudio ativo é \"\(route.outputDeviceName)\" (Bluetooth). Em alguns drivers/OS, o áudio do sistema não chega ao gravador. Se o resultado vier sem áudio do sistema, troque temporariamente o output para os alto-falantes internos."
+            }
+            if route.outputTransport == .airplay {
+                return "O output de áudio ativo é \"\(route.outputDeviceName)\" (AirPlay). AirPlay roteia fora do mixer interno e geralmente impede a captura do áudio do sistema. Troque para um output local."
+            }
+        }
+        return nil
+    }
+
     /// Inicia a gravação. Lança erro se a configuração for inválida ou alguma
     /// permissão for negada.
     func start(
@@ -271,10 +298,17 @@ final class MediaRecorderController: ObservableObject {
     private func mixAudio(tracks: [URL], destination: URL) async throws {
         let composition = AVMutableComposition()
 
+        var emptyTracks: [URL] = []
         for url in tracks {
             let asset = AVURLAsset(url: url)
             let assetTracks = try await asset.loadTracks(withMediaType: .audio)
-            guard let assetTrack = assetTracks.first else { continue }
+            guard let assetTrack = assetTracks.first else {
+                // Antes silenciávamos isso e o usuário recebia o output sem
+                // o áudio do sistema (típico AirPods em HFP). Agora coletamos
+                // pra propagar como erro/warning depois do loop.
+                emptyTracks.append(url)
+                continue
+            }
             guard let compTrack = composition.addMutableTrack(
                 withMediaType: .audio,
                 preferredTrackID: kCMPersistentTrackID_Invalid
@@ -285,6 +319,16 @@ final class MediaRecorderController: ObservableObject {
                 of: assetTrack,
                 at: .zero
             )
+        }
+
+        if composition.tracks(withMediaType: .audio).isEmpty {
+            throw NSError(domain: "MediaRecorder", code: 30, userInfo: [
+                NSLocalizedDescriptionKey: "Nenhuma fonte de áudio capturou samples. Verifique permissões e roteamento de áudio."
+            ])
+        }
+        if !emptyTracks.isEmpty {
+            let names = emptyTracks.map { $0.lastPathComponent }.joined(separator: ", ")
+            NexLog.general.warning("MediaRecorder: faixa(s) de áudio sem samples: \(names)")
         }
 
         try await export(composition: composition, fileType: .m4a, preset: AVAssetExportPresetAppleM4A, to: destination)

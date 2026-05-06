@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import ScreenCaptureKit
+import CoreGraphics
 
 /// Captura **a saída de áudio do sistema** (qualquer som que tocaria nos
 /// alto-falantes) usando ScreenCaptureKit, gravando em `.m4a` (AAC).
@@ -16,17 +17,24 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
         case noContent
         case configurationFailed(String)
         case writerFailed(String)
+        case noSamplesReceived(deviceHint: String?)
 
         var errorDescription: String? {
             switch self {
             case .permissionDenied:
-                return "Permissão de Gravação de Tela negada. Permita em Ajustes do Sistema → Privacidade → Gravação de Tela."
+                return "Permissão de Gravação de Tela negada. Permita em Ajustes do Sistema → Privacidade → Gravação de Tela e reabra o app."
             case .noContent:
                 return "Nenhum display disponível para captura de áudio do sistema."
             case .configurationFailed(let msg):
                 return "Falha ao configurar áudio do sistema: \(msg)"
             case .writerFailed(let msg):
                 return "Falha ao salvar áudio do sistema: \(msg)"
+            case .noSamplesReceived(let deviceHint):
+                let base = "Áudio do sistema não chegou ao gravador (nenhum sample em 3 segundos)."
+                if let hint = deviceHint {
+                    return base + " Provável causa: o output ativo é \(hint), que pode bypassar o mixer interno do macOS quando um microfone Bluetooth é ativado em paralelo. Tente trocar o output para os alto-falantes internos OU usar o microfone interno."
+                }
+                return base + " Verifique se a permissão de Gravação de Tela está concedida e se o output não é Bluetooth/AirPlay."
             }
         }
     }
@@ -36,6 +44,17 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     private var input: AVAssetWriterInput?
     private let queue = DispatchQueue(label: "com.nexia.recorder.system-audio")
     private var didStartSession = false
+
+    /// Counter de samples de áudio recebidos. Usado pelo watchdog para
+    /// detectar quando ScreenCaptureKit "aceitou" a stream mas nada está
+    /// chegando — situação que ocorria silenciosamente quando o output
+    /// estava em Bluetooth/HFP ou a permissão de Screen Recording era stale.
+    private let sampleCount = NSLock()
+    private var _audioSamplesSeen: Int = 0
+    private var audioSamplesSeen: Int {
+        get { sampleCount.lock(); defer { sampleCount.unlock() }; return _audioSamplesSeen }
+        set { sampleCount.lock(); _audioSamplesSeen = newValue; sampleCount.unlock() }
+    }
 
     private(set) var outputURL: URL?
 
@@ -50,6 +69,15 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     // MARK: - Lifecycle
 
     func start(outputURL: URL) async throws {
+        // Pré-checa permissão ANTES de tentar abrir a stream. Sem isso, em
+        // alguns cenários (TCC stale, app re-assinado), `startCapture()`
+        // retorna sucesso mas nenhum sample é entregue — falha silenciosa.
+        if !CGPreflightScreenCaptureAccess() {
+            // Dispara o prompt do sistema (só funciona uma vez por sessão).
+            _ = CGRequestScreenCaptureAccess()
+            throw RecorderError.permissionDenied
+        }
+
         let content: SCShareableContent
         do {
             content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
@@ -90,6 +118,40 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
             throw RecorderError.configurationFailed(error.localizedDescription)
         }
         self.stream = stream
+        audioSamplesSeen = 0
+
+        // Watchdog: se em 3s nenhum sample chegou, aborta com erro acionável.
+        // Isso é o que diferencia "stream rodando mas vazia por causa de
+        // Bluetooth/HFP" de uma gravação real vazia (ex: ninguém tocando som).
+        // 3s é tempo o suficiente para pegar o primeiro buffer mesmo em
+        // sistemas mais lentos, sem travar a UX.
+        try await runStartupWatchdog()
+    }
+
+    private func runStartupWatchdog() async throws {
+        try await Task.sleep(nanoseconds: 3_000_000_000)
+        if audioSamplesSeen == 0 {
+            // Nenhum sample chegou — fecha a stream e propaga erro com hint
+            // baseado no roteamento atual de áudio.
+            if let stream {
+                try? await stream.stopCapture()
+            }
+            stream = nil
+            input?.markAsFinished()
+            writer?.cancelWriting()
+            cleanupAfterStop()
+
+            let route = AudioRouteInspector.currentRoute()
+            let hint: String?
+            if let r = route, r.outputIsBluetooth {
+                hint = "\(r.outputDeviceName) (Bluetooth)"
+            } else if let r = route, r.outputTransport == .airplay {
+                hint = "\(r.outputDeviceName) (AirPlay)"
+            } else {
+                hint = nil
+            }
+            throw RecorderError.noSamplesReceived(deviceHint: hint)
+        }
     }
 
     func stop() async -> URL? {
@@ -168,6 +230,14 @@ final class SystemAudioRecorder: NSObject, SCStreamOutput, SCStreamDelegate {
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .audio else { return }
         guard CMSampleBufferDataIsReady(sampleBuffer) else { return }
+
+        // Incrementa o contador SEMPRE — mesmo se o writer estiver com problema,
+        // saber que samples chegaram diferencia "Bluetooth comeu o áudio" de
+        // "writer falhou". O watchdog de startup só checa esse contador.
+        sampleCount.lock()
+        _audioSamplesSeen += 1
+        sampleCount.unlock()
+
         guard let writer, let input else { return }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)

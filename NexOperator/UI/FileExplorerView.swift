@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
+import QuickLookUI
 
 enum ExplorerViewMode: String {
     case list, gallery
@@ -18,6 +19,8 @@ struct FileExplorerView: View {
     @State private var forwardHistory: [URL] = []
     @State private var renamingItemId: String?
     @State private var renameText = ""
+    @State private var renameError: String?
+    @FocusState private var renameFieldFocused: Bool
     @State private var showNewFolderAlert = false
     @State private var newFolderName = ""
     @State private var showDeleteConfirm = false
@@ -42,6 +45,21 @@ struct FileExplorerView: View {
 
     // Recorder sheet
     @State private var showRecorder = false
+
+    // Type-ahead filter (Finder/Explorer-style): user starts typing while
+    // focused on the file list and items are filtered live by name. Esc clears.
+    @State private var typeAheadFilter: String = ""
+    @State private var typeAheadResetTask: DispatchWorkItem?
+    @FocusState private var listHasFocus: Bool
+
+    /// Items to display: applies the local type-ahead filter on top of
+    /// whatever the provider returns. Case-insensitive substring match on
+    /// the file name. When the filter is empty, returns provider items as-is.
+    private var displayedItems: [FileItem] {
+        guard !typeAheadFilter.isEmpty else { return provider.items }
+        let needle = typeAheadFilter.lowercased()
+        return provider.items.filter { $0.name.lowercased().contains(needle) }
+    }
 
     init(directory: String) {
         self.directory = directory
@@ -127,6 +145,13 @@ struct FileExplorerView: View {
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
+                if let loc = provider.archiveLocation {
+                    archiveBanner(location: loc)
+                }
+                if !typeAheadFilter.isEmpty {
+                    typeAheadBanner
+                }
+
                 fileListHeader
 
                 Divider()
@@ -162,7 +187,21 @@ struct FileExplorerView: View {
             }
         }
         .background(NexTheme.bg)
-        .onAppear { provider.load() }
+        .focusable(true)
+        .focusEffectDisabled()
+        .focused($listHasFocus)
+        .onKeyPress(phases: .down) { press in
+            handleListKeyPress(press)
+        }
+        .onChange(of: provider.currentURL) { _, _ in
+            // Limpa o filtro ao trocar de pasta — comportamento padrão do
+            // Finder/Explorer: o type-ahead é local da pasta atual.
+            clearTypeAheadFilter()
+        }
+        .onAppear {
+            provider.load()
+            listHasFocus = true
+        }
         // Wave 1 · C3: keep the provider in sync when the owning tab navigates
         // externally (sidebar, URL handler, agent file actions in mosaic). Without
         // this, the explorer kept showing the directory it was first mounted with
@@ -285,6 +324,22 @@ struct FileExplorerView: View {
                 showClipboardPasteAlert = true
             }
         }
+        // Atalhos globais ao estilo Finder/Explorer. Implementados como
+        // botões invisíveis no .background pra ficarem ativos sempre que a
+        // view estiver na cadeia de respondedores.
+        .background(
+            VStack(spacing: 0) {
+                Button("", action: goUp).keyboardShortcut(.upArrow, modifiers: [.command])
+                Button("", action: goBack).keyboardShortcut("[", modifiers: [.command])
+                Button("", action: goForward).keyboardShortcut("]", modifiers: [.command])
+                Button("", action: { provider.load() }).keyboardShortcut("r", modifiers: [.command])
+                Button("", action: { showNewFolderAlert = true }).keyboardShortcut("n", modifiers: [.command, .shift])
+                Button("", action: { isSearching = true }).keyboardShortcut("f", modifiers: [.command])
+            }
+            .opacity(0)
+            .frame(width: 0, height: 0)
+            .accessibilityHidden(true)
+        )
     }
 
     // MARK: - Image Gallery
@@ -298,7 +353,7 @@ struct FileExplorerView: View {
             ScrollView {
                 let columns = [GridItem(.adaptive(minimum: thumbnailSize, maximum: thumbnailSize + 40), spacing: 12)]
                 LazyVGrid(columns: columns, spacing: 12) {
-                    ForEach(provider.items) { item in
+                    ForEach(displayedItems) { item in
                         galleryCell(item)
                     }
                 }
@@ -376,19 +431,12 @@ struct FileExplorerView: View {
             }
         }
         .contentShape(Rectangle())
-        .onDrag {
-            let urls = dragURLs(for: item)
-            if urls.count > 1 {
-                let provider = NSItemProvider()
-                for url in urls {
-                    provider.registerObject(url as NSURL, visibility: .all)
-                }
-                return provider
-            }
-            return NSItemProvider(object: (urls.first ?? item.url) as NSURL)
-        }
+        .onDrag { makeDragProvider(for: item) }
         .onTapGesture { handleTap(item) }
-        .onTapGesture(count: 2) { handleDoubleTap(item) }
+        .simultaneousGesture(
+            TapGesture(count: 2).onEnded { handleDoubleTap(item) }
+        )
+        .onRightClick { ensureSelectedForContextMenu(item) }
         .contextMenu {
             FileContextMenu(
                 item: item,
@@ -412,6 +460,16 @@ struct FileExplorerView: View {
                 }
             )
             .environmentObject(appState)
+        }
+    }
+
+    /// Garante que o item alvo do right-click está na seleção. Se ele já
+    /// estava (sozinho ou junto com outros), mantém. Senão, substitui a
+    /// seleção pelo item — espelha o comportamento do Finder/Explorer.
+    private func ensureSelectedForContextMenu(_ item: FileItem) {
+        if !selectedItems.contains(item.id) {
+            selectedItems = [item.id]
+            lastClickedItemId = item.id
         }
     }
 
@@ -464,14 +522,21 @@ struct FileExplorerView: View {
     private var fileList: some View {
         ScrollView {
             ZStack(alignment: .topLeading) {
-                // Background tap = deselect / Cmd+A select all anchor.
+                // Background tap = deselect (e commita rename pendente, se
+                // houver — comportamento clássico do Finder).
                 Color.clear
                     .contentShape(Rectangle())
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .onTapGesture { selectedItems.removeAll() }
+                    .onTapGesture {
+                        if let id = renamingItemId,
+                           let item = provider.items.first(where: { $0.id == id }) {
+                            commitRename(item)
+                        }
+                        selectedItems.removeAll()
+                    }
 
                 LazyVStack(spacing: 0) {
-                    ForEach(provider.items) { item in
+                    ForEach(displayedItems) { item in
                         fileRow(item)
                             .background(
                                 GeometryReader { geo in
@@ -555,6 +620,63 @@ struct FileExplorerView: View {
         return [item.url]
     }
 
+    /// Constrói o `NSItemProvider` para arrastar `item`. Trata 3 casos:
+    /// 1. Item normal de filesystem → URL direta;
+    /// 2. Multi-seleção → várias URLs;
+    /// 3. Entry virtual dentro de archive → registra um provedor preguiçoso
+    ///    que extrai a entry sob demanda quando o destino solicitar a URL.
+    ///    Isso evita extrair desnecessariamente arquivos muito grandes.
+    private func makeDragProvider(for item: FileItem) -> NSItemProvider {
+        if let origin = item.archiveOrigin, !origin.isDirectory {
+            return makeArchiveEntryProvider(item: item, origin: origin)
+        }
+        let urls = dragURLs(for: item)
+        if urls.count > 1 {
+            let provider = NSItemProvider()
+            for url in urls {
+                provider.registerObject(url as NSURL, visibility: .all)
+            }
+            return provider
+        }
+        return NSItemProvider(object: (urls.first ?? item.url) as NSURL)
+    }
+
+    private func makeArchiveEntryProvider(item: FileItem, origin: ArchiveOrigin) -> NSItemProvider {
+        let provider = NSItemProvider()
+        let typeID = "public.file-url"
+        provider.suggestedName = item.name
+        provider.registerFileRepresentation(
+            forTypeIdentifier: typeID,
+            fileOptions: [],
+            visibility: .all
+        ) { completion in
+            let tempDir = FileManager.default.temporaryDirectory
+                .appendingPathComponent("nex_drag_\(UUID().uuidString)", isDirectory: true)
+            do {
+                try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+            } catch {
+                completion(nil, false, error)
+                return nil
+            }
+            let outFile = tempDir.appendingPathComponent(item.name)
+            let entry = ArchiveEntry(
+                path: origin.internalPath, isDirectory: false,
+                size: item.size, modified: item.modifiedDate
+            )
+            let archive = origin.archiveURL
+            Task.detached {
+                do {
+                    try await ArchiveService.extractEntry(entry, from: archive, to: outFile)
+                    completion(outFile, true, nil)
+                } catch {
+                    completion(nil, false, error)
+                }
+            }
+            return nil
+        }
+        return provider
+    }
+
     private func fileRow(_ item: FileItem) -> some View {
         let isSelected = selectedItems.contains(item.id)
         let isRenaming = renamingItemId == item.id
@@ -567,13 +689,7 @@ struct FileExplorerView: View {
                     .frame(width: 20, height: 20)
 
                 if isRenaming {
-                    TextField("", text: $renameText, onCommit: {
-                        commitRename(item)
-                    })
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(size: 12))
-                    .frame(maxWidth: 200)
-                    .onExitCommand { cancelRename() }
+                    renameField(item: item)
                 } else {
                     Text(item.name)
                         .font(.system(size: 12, weight: item.isDirectory ? .medium : .regular))
@@ -611,29 +727,21 @@ struct FileExplorerView: View {
                 .stroke(isSelected ? NexTheme.accent.opacity(0.3) : Color.clear, lineWidth: 0.5)
         )
         .contentShape(Rectangle())
-        .onDrag {
-            let urls = dragURLs(for: item)
-            if urls.count > 1 {
-                let provider = NSItemProvider()
-                for url in urls {
-                    provider.registerObject(url as NSURL, visibility: .all)
-                }
-                return provider
-            }
-            return NSItemProvider(object: (urls.first ?? item.url) as NSURL)
-        }
-        .if(item.isDirectory) { view in
+        .onDrag { makeDragProvider(for: item) }
+        .if(item.isDirectory && item.archiveOrigin == nil) { view in
             view.onDrop(of: [.fileURL], isTargeted: nil) { providers in
                 handleDrop(providers: providers, destination: item.url)
                 return true
             }
         }
-        .onTapGesture {
-            handleTap(item)
-        }
-        .onTapGesture(count: 2) {
-            handleDoubleTap(item)
-        }
+        // Single-click responsivo: dispara `handleTap` imediatamente sem
+        // esperar o timer do double-click (que acrescentava ~250ms de lag
+        // perceptível). O segundo tap roda em paralelo via simultaneous.
+        .onTapGesture { handleTap(item) }
+        .simultaneousGesture(
+            TapGesture(count: 2).onEnded { handleDoubleTap(item) }
+        )
+        .onRightClick { ensureSelectedForContextMenu(item) }
         .contextMenu {
             FileContextMenu(
                 item: item,
@@ -723,6 +831,11 @@ struct FileExplorerView: View {
     // MARK: - Interaction
 
     private func handleTap(_ item: FileItem) {
+        // Se há um rename ativo em outro item, commita antes de mudar seleção.
+        if let activeRenameId = renamingItemId, activeRenameId != item.id,
+           let activeItem = provider.items.first(where: { $0.id == activeRenameId }) {
+            commitRename(activeItem)
+        }
         let modifiers = NSEvent.modifierFlags
         if modifiers.contains(.shift), let anchorId = lastClickedItemId {
             guard let anchorIndex = provider.items.firstIndex(where: { $0.id == anchorId }),
@@ -752,10 +865,66 @@ struct FileExplorerView: View {
     }
 
     private func handleDoubleTap(_ item: FileItem) {
+        // Navegação dentro de archive: pasta virtual = navega no archive.
+        if let origin = item.archiveOrigin {
+            if origin.isDirectory {
+                provider.navigateInsideArchive(toSubPath: origin.internalPath)
+                selectedItems.removeAll()
+            } else {
+                // Entry de arquivo dentro do archive: extrai pra temp e abre.
+                openArchiveEntryExternally(item)
+            }
+            return
+        }
         if item.isDirectory {
             navigateTo(item.url)
+        } else if item.isArchive {
+            // Entrar no archive como se fosse uma pasta — comportamento estilo
+            // Windows Explorer/macOS Finder Archive Utility.
+            enterArchive(item)
         } else {
             FileItemProvider.openFile(item.url)
+        }
+    }
+
+    /// Tenta entrar no archive. Em caso de erro (tool ausente, archive
+    /// corrompido, etc.) mostra o erro no banner padrão do explorer.
+    private func enterArchive(_ item: FileItem) {
+        navigationHistory.append(provider.currentURL)
+        forwardHistory.removeAll()
+        Task {
+            do {
+                try await provider.enterArchive(item.url)
+                selectedItems.removeAll()
+                clearTypeAheadFilter()
+            } catch {
+                // Reverte o histórico já que não conseguimos entrar.
+                _ = navigationHistory.popLast()
+                provider.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
+        }
+    }
+
+    /// Extrai uma entry de archive pra um diretório temp e abre com o app
+    /// padrão do macOS — comportamento "preview" do Windows ao dar duplo
+    /// clique em um arquivo dentro de um zip.
+    private func openArchiveEntryExternally(_ item: FileItem) {
+        guard let origin = item.archiveOrigin else { return }
+        Task {
+            do {
+                let tempDir = FileManager.default.temporaryDirectory
+                    .appendingPathComponent("nex_archive_open_\(UUID().uuidString)", isDirectory: true)
+                try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+                let outFile = tempDir.appendingPathComponent(item.name)
+                let entry = ArchiveEntry(
+                    path: origin.internalPath, isDirectory: false,
+                    size: item.size, modified: item.modifiedDate
+                )
+                try await ArchiveService.extractEntry(entry, from: origin.archiveURL, to: outFile)
+                FileItemProvider.openFile(outFile)
+            } catch {
+                provider.error = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            }
         }
     }
 
@@ -771,6 +940,13 @@ struct FileExplorerView: View {
     }
 
     private func goBack() {
+        // Voltar a partir de dentro de um archive sai do archive direto, sem
+        // empilhar mais histórico — o histórico só faz sentido pra path real.
+        if provider.isInsideArchive {
+            provider.exitArchive()
+            selectedItems.removeAll()
+            return
+        }
         guard let prev = navigationHistory.popLast() else { return }
         forwardHistory.append(provider.currentURL)
         provider.navigate(to: prev)
@@ -787,6 +963,18 @@ struct FileExplorerView: View {
     }
 
     private func goUp() {
+        // Em modo archive: sobe um nível dentro do archive ou sai dele.
+        if let loc = provider.archiveLocation {
+            if loc.subPath.isEmpty {
+                provider.exitArchive()
+                selectedItems.removeAll()
+            } else {
+                let parent = (loc.subPath as NSString).deletingLastPathComponent
+                provider.navigateInsideArchive(toSubPath: parent == "/" ? "" : parent)
+                selectedItems.removeAll()
+            }
+            return
+        }
         let parent = provider.currentURL.deletingLastPathComponent()
         guard parent != provider.currentURL else { return }
         navigateTo(parent)
@@ -810,6 +998,9 @@ struct FileExplorerView: View {
     // MARK: - Drag & Drop
 
     private func handleDrop(providers: [NSItemProvider], destination: URL) {
+        // Drops dentro de archives são ignorados — arquivos virtuais não
+        // suportam mutações no momento.
+        if provider.isInsideArchive { return }
         for p in providers {
             p.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
                 guard let data = data as? Data,
@@ -830,24 +1021,409 @@ struct FileExplorerView: View {
         }
     }
 
+    // MARK: - Archive browsing
+
+    /// Banner mostrado quando o usuário está navegando dentro de um zip/rar/7z.
+    /// Tem botão pra sair, breadcrumb interno e ação de extrair tudo.
+    private func archiveBanner(location: ArchiveLocation) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: "doc.zipper")
+                .foregroundColor(.purple)
+                .font(.system(size: 13, weight: .semibold))
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 4) {
+                    Text("Dentro de \(location.kind.humanLabel):")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(NexTheme.textPrimary)
+                    Text(location.archiveURL.lastPathComponent)
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(NexTheme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                if !location.subPath.isEmpty {
+                    Text("/ \(location.subPath)")
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(NexTheme.textSecondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+            Spacer()
+            Button {
+                extractCurrentArchiveAll(askDestination: false)
+            } label: {
+                Label("Extrair Tudo", systemImage: "arrow.down.doc.fill")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(Color.purple.opacity(0.12))
+            .cornerRadius(4)
+            .help("Extrai todo o conteúdo do archive ao lado dele")
+
+            Button {
+                provider.exitArchive()
+                selectedItems.removeAll()
+            } label: {
+                Label("Sair", systemImage: "xmark")
+                    .font(.system(size: 11))
+            }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(NexTheme.surface)
+            .cornerRadius(4)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 5)
+        .background(Color.purple.opacity(0.06))
+        .overlay(
+            Rectangle().frame(height: 0.5).foregroundColor(Color.purple.opacity(0.3)),
+            alignment: .bottom
+        )
+    }
+
+    /// Extrai todo o archive atualmente aberto. Quando `askDestination`,
+    /// abre um NSOpenPanel pra escolher pasta destino — caso contrário,
+    /// extrai pra pasta que contém o archive (comportamento padrão).
+    private func extractCurrentArchiveAll(askDestination: Bool) {
+        guard let loc = provider.archiveLocation else { return }
+        let baseName = loc.archiveURL.deletingPathExtension().lastPathComponent
+        let defaultDest = loc.archiveURL.deletingLastPathComponent()
+            .appendingPathComponent(baseName, isDirectory: true)
+        let dest: URL
+        if askDestination {
+            let panel = NSOpenPanel()
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.allowsMultipleSelection = false
+            panel.directoryURL = loc.archiveURL.deletingLastPathComponent()
+            panel.prompt = "Extrair Aqui"
+            panel.message = "Escolha onde extrair \(loc.archiveURL.lastPathComponent)"
+            guard panel.runModal() == .OK, let chosen = panel.url else { return }
+            dest = chosen.appendingPathComponent(baseName, isDirectory: true)
+        } else {
+            dest = defaultDest
+        }
+        Task {
+            do {
+                try await ArchiveService.extractAll(from: loc.archiveURL, to: dest)
+                batchMessage = "Conteúdo extraído em \(dest.lastPathComponent)/"
+                showBatchProgress = true
+                NSWorkspace.shared.activateFileViewerSelecting([dest])
+            } catch {
+                batchMessage = "Falha ao extrair: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)"
+                showBatchProgress = true
+            }
+        }
+    }
+
+    // MARK: - Type-ahead filter & keyboard
+
+    /// Banner mostrado no topo da lista quando o filtro está ativo.
+    private var typeAheadBanner: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "line.3.horizontal.decrease.circle.fill")
+                .font(.system(size: 11))
+                .foregroundColor(NexTheme.accent)
+            Text("Filtrando por:")
+                .font(.system(size: 11))
+                .foregroundColor(NexTheme.textSecondary)
+            Text("\"\(typeAheadFilter)\"")
+                .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                .foregroundColor(NexTheme.textPrimary)
+            Text("· \(displayedItems.count) de \(provider.items.count)")
+                .font(.system(size: 11))
+                .foregroundColor(NexTheme.textSecondary)
+            Spacer()
+            Button(action: clearTypeAheadFilter) {
+                HStack(spacing: 3) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.system(size: 10))
+                    Text("Limpar (Esc)")
+                        .font(.system(size: 10))
+                }
+                .foregroundColor(NexTheme.textSecondary)
+            }
+            .buttonStyle(.plain)
+            .help("Limpar filtro de digitação")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .background(NexTheme.accent.opacity(0.06))
+        .overlay(
+            Rectangle()
+                .frame(height: 0.5)
+                .foregroundColor(NexTheme.accent.opacity(0.3)),
+            alignment: .bottom
+        )
+    }
+
+    /// Function keys reservadas (F1–F19 do macOS, mapeadas para o private-use
+    /// area do Unicode). Devem ser ignoradas pelo type-ahead pra não poluir
+    /// o filtro com `\u{F704}`, `\u{F705}` etc.
+    private static let functionKeyScalarRange: ClosedRange<UInt32> = 0xF700...0xF8FF
+
+    /// Trata teclas pressionadas com a lista focada. Retorna `.handled` quando
+    /// consome o evento (impede que ele propague pra menus etc).
+    /// - F2 → inicia rename do único item selecionado.
+    /// - Enter → abre item selecionado (folder = navega; arquivo = open).
+    /// - Setas ↑/↓ → navega seleção pra cima/baixo.
+    /// - Esc → limpa filtro; se vazio, limpa seleção.
+    /// - Backspace → remove último char do filtro.
+    /// - Caracteres imprimíveis (sem Cmd/Ctrl) → adiciona ao filtro.
+    /// - Function keys, Tab, etc → ignorados.
+    private func handleListKeyPress(_ press: KeyPress) -> KeyPress.Result {
+        // Não interfere quando há modificadores de comando — Cmd+A, Cmd+C, etc.
+        if press.modifiers.contains(.command) || press.modifiers.contains(.control) {
+            return .ignored
+        }
+        // Não interfere se já existe um item em modo rename — o TextField captura.
+        if renamingItemId != nil { return .ignored }
+
+        // F2: rename — checagem específica antes do filtro de function keys.
+        if press.key == .init("\u{F705}") /* NSF2FunctionKey */ {
+            triggerRenameForSelection()
+            return .handled
+        }
+
+        switch press.key {
+        case .escape:
+            // 1ª Esc → limpa filtro; 2ª Esc → limpa seleção. Comportamento
+            // idêntico ao Finder.
+            if !typeAheadFilter.isEmpty {
+                clearTypeAheadFilter()
+                return .handled
+            }
+            if !selectedItems.isEmpty {
+                selectedItems.removeAll()
+                lastClickedItemId = nil
+                return .handled
+            }
+            return .ignored
+        case .delete: // backspace
+            if !typeAheadFilter.isEmpty {
+                typeAheadFilter.removeLast()
+                scheduleTypeAheadAutoReset()
+                return .handled
+            }
+            return .ignored
+        case .return:
+            // Enter abre o item selecionado (1 selecionado). Se 0 ou múltiplos,
+            // ignora — múltipla abertura seria cara.
+            if selectedItems.count == 1, let id = selectedItems.first,
+               let item = displayedItems.first(where: { $0.id == id }) {
+                handleDoubleTap(item)
+                return .handled
+            }
+            return .ignored
+        case .upArrow:
+            return moveSelection(by: -1, extending: press.modifiers.contains(.shift))
+        case .downArrow:
+            return moveSelection(by: +1, extending: press.modifiers.contains(.shift))
+        case .leftArrow:
+            // ← em modo lista navega de volta (Finder/Explorer comum).
+            goBack()
+            return .handled
+        case .rightArrow:
+            // → abre item selecionado (consistente com Cmd+↓).
+            if selectedItems.count == 1, let id = selectedItems.first,
+               let item = displayedItems.first(where: { $0.id == id }) {
+                handleDoubleTap(item)
+                return .handled
+            }
+            return .ignored
+        case .space:
+            // Quick Look — só pra arquivos previewable, e somente quando há
+            // exatamente 1 selecionado. Sem múltipla preview por ora.
+            if selectedItems.count == 1, let id = selectedItems.first,
+               let item = displayedItems.first(where: { $0.id == id }),
+               item.isPreviewable {
+                showQuickLookForItem(item)
+                return .handled
+            }
+            return .ignored
+        default:
+            break
+        }
+
+        // Filtra out function keys (F1–F19) e demais chars do private-use area.
+        let ch = press.characters
+        if ch.count == 1, let scalar = ch.unicodeScalars.first {
+            if Self.functionKeyScalarRange.contains(scalar.value) {
+                return .ignored
+            }
+            // Caracteres imprimíveis (>= space, != DEL) entram no filtro.
+            if scalar.value >= 0x20, scalar.value != 0x7F {
+                typeAheadFilter.append(ch)
+                scheduleTypeAheadAutoReset()
+                // Auto-seleciona o primeiro item visível pra navegação ficar fluida.
+                if let first = displayedItems.first {
+                    selectedItems = [first.id]
+                    lastClickedItemId = first.id
+                }
+                return .handled
+            }
+        }
+        return .ignored
+    }
+
+    /// Move a seleção para próxima/anterior linha. Se `extending`, mantém os
+    /// items já selecionados (range Shift+↑/↓).
+    private func moveSelection(by delta: Int, extending: Bool) -> KeyPress.Result {
+        let visible = displayedItems
+        guard !visible.isEmpty else { return .ignored }
+        let currentId = lastClickedItemId ?? selectedItems.first
+        let currentIndex = visible.firstIndex(where: { $0.id == currentId }) ?? -1
+        let newIndex = max(0, min(visible.count - 1, currentIndex + delta))
+        let target = visible[newIndex]
+        if extending {
+            selectedItems.insert(target.id)
+        } else {
+            selectedItems = [target.id]
+        }
+        lastClickedItemId = target.id
+        return .handled
+    }
+
+    /// Abre Quick Look para um item específico (chamado pelo atalho Space).
+    private func showQuickLookForItem(_ item: FileItem) {
+        let panel = QLPreviewPanel.shared()!
+        let delegate = QuickLookCoordinator(url: item.url)
+        objc_setAssociatedObject(panel, "qlCoordinator", delegate, .OBJC_ASSOCIATION_RETAIN)
+        panel.dataSource = delegate
+        panel.delegate = delegate
+        panel.makeKeyAndOrderFront(nil)
+    }
+
+    private func clearTypeAheadFilter() {
+        typeAheadFilter = ""
+        typeAheadResetTask?.cancel()
+        typeAheadResetTask = nil
+    }
+
+    /// Auto-limpa o filtro depois de 2.5s de inatividade — comportamento de
+    /// type-ahead clássico do macOS Finder, evita ficar com filtro "preso".
+    private func scheduleTypeAheadAutoReset() {
+        typeAheadResetTask?.cancel()
+        let task = DispatchWorkItem { [self] in
+            self.typeAheadFilter = ""
+        }
+        typeAheadResetTask = task
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5, execute: task)
+    }
+
+    /// F2: dispara rename quando há exatamente UM item selecionado.
+    private func triggerRenameForSelection() {
+        guard selectedItems.count == 1, let id = selectedItems.first else { return }
+        guard let item = provider.items.first(where: { $0.id == id }) else { return }
+        startRename(item)
+    }
+
     // MARK: - Rename
 
+    /// Caracteres proibidos em nomes de arquivos no APFS/HFS+. `:` por
+    /// causa do legacy Mac OS Classic, `/` por ser separador de path.
+    /// Strings com qualquer um geram erro silencioso no FileManager — então
+    /// barramos no UI antes do commit.
+    private static let forbiddenFilenameChars = CharacterSet(charactersIn: "/:")
+
+    /// Campo de edição de rename. Faz auto-focus, seleciona apenas o
+    /// "basename" (nome sem extensão) ao abrir, valida caracteres proibidos
+    /// em tempo real e mostra erro inline. Esc cancela, Enter commita.
+    @ViewBuilder
+    private func renameField(item: FileItem) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            TextField("", text: $renameText, onCommit: {
+                commitRename(item)
+            })
+            .textFieldStyle(.roundedBorder)
+            .font(.system(size: 12))
+            .frame(maxWidth: 240)
+            .focused($renameFieldFocused)
+            .onChange(of: renameText) { _, newValue in
+                let sanitized = String(newValue.unicodeScalars.filter {
+                    !Self.forbiddenFilenameChars.contains($0)
+                })
+                if sanitized != newValue {
+                    renameText = sanitized
+                    renameError = "Os caracteres / e : não são permitidos"
+                } else {
+                    renameError = nil
+                }
+            }
+            .onExitCommand { cancelRename() }
+            .onAppear {
+                // SwiftUI 1.x não tem API direta pra "selecionar até o ponto
+                // antes da extensão". Mas no AppKit o NSTextField faz o
+                // currentEditor selecionar tudo por padrão ao receber foco;
+                // re-selecionamos só o basename via NSApp.keyWindow logo
+                // depois.
+                DispatchQueue.main.async {
+                    renameFieldFocused = true
+                    selectBasenameOnly(of: item.name)
+                }
+            }
+
+            if let err = renameError {
+                Text(err)
+                    .font(.system(size: 9))
+                    .foregroundColor(.orange)
+            }
+        }
+    }
+
+    /// Re-seleciona somente o basename (nome sem extensão) no NSTextField
+    /// que está sendo editado. Comportamento idêntico ao Finder ao abrir
+    /// o rename (Enter no Finder seleciona "arquivo", deixa ".txt" fora).
+    private func selectBasenameOnly(of fullName: String) {
+        guard let window = NSApp.keyWindow,
+              let editor = window.firstResponder as? NSTextView else { return }
+        let nsName = fullName as NSString
+        let ext = nsName.pathExtension
+        if ext.isEmpty { return }  // sem extensão: deixa tudo selecionado
+        let basenameLength = nsName.length - ext.count - 1  // -1 do ponto
+        guard basenameLength > 0 else { return }
+        editor.setSelectedRange(NSRange(location: 0, length: basenameLength))
+    }
+
     private func startRename(_ item: FileItem) {
+        // Não permite renomear entries virtuais (filesystem read-only de archive).
+        if item.archiveOrigin != nil {
+            batchMessage = "Renomear não é suportado dentro de archives"
+            showBatchProgress = true
+            return
+        }
         renamingItemId = item.id
         renameText = item.name
+        renameError = nil
     }
 
     private func commitRename(_ item: FileItem) {
         let newName = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !newName.isEmpty && newName != item.name {
-            try? provider.rename(item: item, to: newName)
+        guard !newName.isEmpty else { cancelRename(); return }
+        guard newName != item.name else { cancelRename(); return }
+        // Conflito: já existe arquivo com esse nome no diretório.
+        let candidate = item.url.deletingLastPathComponent().appendingPathComponent(newName)
+        if FileManager.default.fileExists(atPath: candidate.path) {
+            renameError = "Já existe um item chamado '\(newName)'"
+            return
         }
-        cancelRename()
+        do {
+            try provider.rename(item: item, to: newName)
+            cancelRename()
+        } catch {
+            renameError = "Falha: \(error.localizedDescription)"
+        }
     }
 
     private func cancelRename() {
         renamingItemId = nil
         renameText = ""
+        renameError = nil
+        renameFieldFocused = false
     }
 
     // MARK: - Attach / Terminal Integration
@@ -1057,5 +1633,49 @@ struct RowFramesPreferenceKey: PreferenceKey {
     static var defaultValue: [String: CGRect] = [:]
     static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { _, b in b })
+    }
+}
+
+// MARK: - Right-click detection
+
+/// Detecta right-click (`rightMouseDown`) numa view SwiftUI antes do
+/// `.contextMenu` abrir. Usado pra garantir que o item clicado entre na
+/// seleção visual — comportamento padrão do Finder/Explorer onde o
+/// menu reflete o item alvo mesmo se ele não estava selecionado antes.
+struct RightClickDetector: NSViewRepresentable {
+    let onRightClick: () -> Void
+
+    func makeNSView(context: Context) -> NSView {
+        let view = ClickAwareView()
+        view.onRightClick = onRightClick
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? ClickAwareView)?.onRightClick = onRightClick
+    }
+
+    final class ClickAwareView: NSView {
+        var onRightClick: (() -> Void)?
+
+        override func rightMouseDown(with event: NSEvent) {
+            onRightClick?()
+            super.rightMouseDown(with: event)
+        }
+
+        override func hitTest(_ point: NSPoint) -> NSView? {
+            // Não bloqueia eventos de mouse — só quer "ver" o right-click,
+            // sem interceptar tap/drag/etc do SwiftUI por baixo.
+            return nil
+        }
+    }
+}
+
+extension View {
+    /// Executa `action` quando o usuário faz right-click nesta view, antes
+    /// do `.contextMenu` abrir. Combinar com `.contextMenu` para refletir
+    /// o item-alvo na seleção.
+    func onRightClick(perform action: @escaping () -> Void) -> some View {
+        background(RightClickDetector(onRightClick: action))
     }
 }

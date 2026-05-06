@@ -52,7 +52,59 @@ struct FileContextMenu: View {
         item.isDirectory ? .unsupported : MediaKind.of(item.url)
     }
 
+    /// `true` quando o item é uma entry virtual dentro de um archive — nesse
+    /// caso só permitimos ações de leitura (extração, copiar path, etc).
+    /// Mutações no filesystem são bloqueadas porque a "URL" da entry é
+    /// virtual.
+    private var isArchiveEntry: Bool { item.archiveOrigin != nil }
+
     var body: some View {
+        Group {
+            if isArchiveEntry {
+                archiveEntryMenu
+            } else {
+                fileSystemMenu
+            }
+        }
+    }
+
+    /// Menu reduzido pra entries virtuais dentro de archives (zip/rar/7z).
+    /// Não permite renomear, mover, deletar, recortar ou alterar tags —
+    /// nada do filesystem real funciona em URLs virtuais.
+    @ViewBuilder
+    private var archiveEntryMenu: some View {
+        Button("Abrir") {
+            if let origin = item.archiveOrigin {
+                if origin.isDirectory {
+                    provider.navigateInsideArchive(toSubPath: origin.internalPath)
+                } else {
+                    extractSingleEntry(origin: origin)
+                }
+            }
+        }
+
+        if let origin = item.archiveOrigin, !origin.isDirectory {
+            Button("Extrair este arquivo...") {
+                extractSingleEntry(origin: origin)
+            }
+        }
+
+        Divider()
+
+        Button("Copiar nome") {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(item.name, forType: .string)
+        }
+        Button("Copiar caminho dentro do archive") {
+            if let origin = item.archiveOrigin {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(origin.internalPath, forType: .string)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var fileSystemMenu: some View {
         Group {
             Button("Abrir") {
                 if item.isDirectory {
@@ -60,6 +112,25 @@ struct FileContextMenu: View {
                 } else {
                     FileItemProvider.openFile(item.url)
                 }
+            }
+
+            // Archive: opções específicas pra zip/rar/7z. Abrir como Pasta
+            // entra no archive sem extrair; Extrair Aqui descompacta ao
+            // lado; Extrair Para... abre seletor de destino.
+            if item.isArchive {
+                Button("Abrir como Pasta") {
+                    Task {
+                        do { try await provider.enterArchive(item.url) }
+                        catch { onBatchResult?("Falha ao abrir archive: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)") }
+                    }
+                }
+                Button("Extrair Aqui") {
+                    extractArchiveHere()
+                }
+                Button("Extrair Para...") {
+                    extractArchiveToChosen()
+                }
+                Divider()
             }
 
             Button("Abrir no Finder") {
@@ -499,6 +570,86 @@ struct FileContextMenu: View {
         panel.delegate = delegate
         panel.makeKeyAndOrderFront(nil)
         panel.center()
+    }
+
+    // MARK: - Archive actions
+
+    /// Extrai o archive `item.url` numa pasta com o mesmo nome (sem extensão)
+    /// dentro do diretório atual. Comportamento "Extract Here" do Windows.
+    private func extractArchiveHere() {
+        let baseName = item.url.deletingPathExtension().lastPathComponent
+        let dest = currentDirectory.appendingPathComponent(baseName, isDirectory: true)
+        let archive = item.url
+        Task {
+            do {
+                try await ArchiveService.extractAll(from: archive, to: dest)
+                await MainActor.run {
+                    onBatchResult?("Extraído em \(dest.lastPathComponent)/")
+                    NSWorkspace.shared.activateFileViewerSelecting([dest])
+                }
+            } catch {
+                await MainActor.run {
+                    onBatchResult?("Falha ao extrair: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// Abre seletor de pasta e extrai o archive lá dentro, em uma sub-pasta
+    /// com o nome do archive.
+    private func extractArchiveToChosen() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = currentDirectory
+        panel.prompt = "Extrair Aqui"
+        panel.message = "Escolha onde extrair \(item.name)"
+        guard panel.runModal() == .OK, let chosen = panel.url else { return }
+        let baseName = item.url.deletingPathExtension().lastPathComponent
+        let dest = chosen.appendingPathComponent(baseName, isDirectory: true)
+        let archive = item.url
+        Task {
+            do {
+                try await ArchiveService.extractAll(from: archive, to: dest)
+                await MainActor.run {
+                    onBatchResult?("Extraído em \(chosen.lastPathComponent)/\(baseName)/")
+                    NSWorkspace.shared.activateFileViewerSelecting([dest])
+                }
+            } catch {
+                await MainActor.run {
+                    onBatchResult?("Falha ao extrair: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
+                }
+            }
+        }
+    }
+
+    /// Extrai UMA entry específica (estamos dentro de um archive). Pede
+    /// destino via NSSavePanel — usuário pode renomear na hora.
+    private func extractSingleEntry(origin: ArchiveOrigin) {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = item.name
+        panel.directoryURL = currentDirectory
+        panel.message = "Extrair \(item.name)"
+        guard panel.runModal() == .OK, let dest = panel.url else { return }
+        let entry = ArchiveEntry(
+            path: origin.internalPath, isDirectory: false,
+            size: item.size, modified: item.modifiedDate
+        )
+        let archive = origin.archiveURL
+        Task {
+            do {
+                try await ArchiveService.extractEntry(entry, from: archive, to: dest)
+                await MainActor.run {
+                    onBatchResult?("Extraído: \(dest.lastPathComponent)")
+                    NSWorkspace.shared.activateFileViewerSelecting([dest])
+                }
+            } catch {
+                await MainActor.run {
+                    onBatchResult?("Falha ao extrair: \((error as? LocalizedError)?.errorDescription ?? error.localizedDescription)")
+                }
+            }
+        }
     }
 }
 

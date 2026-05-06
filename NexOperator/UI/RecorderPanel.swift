@@ -33,6 +33,9 @@ struct RecorderPanel: View {
     @State private var showFolderPicker = false
     /// URL final escolhida pelo usuário no fim (quando `askDestinationAfterRecording`).
     @State private var resolvedFinalURL: URL?
+    /// Mensagem de pré-flight (ex: "AirPods em uso → áudio do sistema não vai
+    /// gravar"). Quando setada, o usuário precisa confirmar antes do start.
+    @State private var advisoryMessage: String?
 
     init(
         suggestedDirectory: URL?,
@@ -113,6 +116,9 @@ struct RecorderPanel: View {
             if selectedMode.needsMic { micSection }
             if selectedMode.isVideo { displaySection }
             outputSection
+            if let advisoryMessage {
+                advisoryBanner(advisoryMessage)
+            }
             if let errorMessage {
                 Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
                     .font(.system(size: 11))
@@ -123,12 +129,14 @@ struct RecorderPanel: View {
             } label: {
                 HStack(spacing: 6) {
                     Image(systemName: "record.circle.fill")
-                    Text(controller.state == .preparing ? "Preparando..." : "Iniciar Gravação")
+                    Text(controller.state == .preparing ? "Preparando..."
+                         : (advisoryMessage != nil ? "Iniciar Mesmo Assim" : "Iniciar Gravação"))
                         .font(.system(size: 13, weight: .semibold))
                 }
                 .frame(maxWidth: .infinity)
                 .padding(.vertical, 9)
-                .background(canStart ? Color.red : Color.gray.opacity(0.4))
+                .background(canStart ? (advisoryMessage != nil ? Color.orange : Color.red)
+                                     : Color.gray.opacity(0.4))
                 .foregroundColor(.white)
                 .cornerRadius(6)
             }
@@ -136,6 +144,32 @@ struct RecorderPanel: View {
             .disabled(!canStart || controller.state == .preparing)
         }
         .padding(14)
+        .onChange(of: selectedMode) { _, _ in refreshAdvisory() }
+        .onChange(of: selectedMicID) { _, _ in refreshAdvisory() }
+    }
+
+    private func advisoryBanner(_ text: String) -> some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundColor(.orange)
+                .font(.system(size: 13))
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Atenção")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundColor(.orange)
+                Text(text)
+                    .font(.system(size: 11))
+                    .foregroundColor(NexTheme.textPrimary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.08))
+        .overlay(
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(Color.orange.opacity(0.4), lineWidth: 0.5)
+        )
+        .cornerRadius(4)
     }
 
     private var modeSection: some View {
@@ -522,6 +556,14 @@ struct RecorderPanel: View {
                 NexLog.general.warning("Falha ao listar displays: \(error.localizedDescription)")
             }
         }
+        refreshAdvisory()
+    }
+
+    private func refreshAdvisory() {
+        advisoryMessage = MediaRecorderController.preflightAdvisory(
+            mode: selectedMode,
+            micID: selectedMicID
+        )
     }
 
     private func initializeDefaults() {

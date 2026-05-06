@@ -208,22 +208,26 @@ for KEY in "audio-input" "disable-library-validation"; do
     fi
 done
 
-# Smoke test: app realmente abre? (detecta crashes de dyld antes do release sair)
-# IMPORTANTE: o `wait`/`kill` retornam exit codes != 0 quando o processo é
-# terminado por sinal (143 = SIGTERM). Como temos `set -e`, qualquer um
-# desses derrubaria o script. Por isso desabilitamos `set -e` localmente.
-"$APP_PATH/Contents/MacOS/${APP_NAME}" >/tmp/${APP_NAME}-smoke.log 2>&1 &
-SMOKE_PID=$!
-sleep 3
+# Smoke test: app realmente abre? (detecta crashes de dyld antes do release sair).
+# IMPORTANTE: usamos `open -a` em vez de executar o binário direto porque rodar
+# `Contents/MacOS/<App>` fora do LaunchServices não inicializa NSApplication
+# corretamente — o app sai imediatamente sem janela mesmo estando saudável,
+# o que dava falso positivo de "crash" no script.
+# Cuidado: `set -e` global derrubaria o script em qualquer pkill/pgrep que
+# retornasse 1 (no processes matched), por isso encapsulamos TUDO em set +e.
 set +e
-if kill -0 $SMOKE_PID 2>/dev/null; then
-    kill $SMOKE_PID 2>/dev/null
-    wait $SMOKE_PID 2>/dev/null
-    pkill -x "$APP_NAME" 2>/dev/null
+pkill -x "$APP_NAME" >/dev/null 2>&1
+sleep 0.5
+open -a "$(cd "$(dirname "$APP_PATH")" && pwd)/$(basename "$APP_PATH")" >/tmp/${APP_NAME}-smoke.log 2>&1
+OPEN_EC=$?
+sleep 3
+if [ "$OPEN_EC" = "0" ] && pgrep -x "$APP_NAME" >/dev/null 2>&1; then
     SMOKE_OK=1
 else
     SMOKE_OK=0
 fi
+pkill -x "$APP_NAME" >/dev/null 2>&1
+sleep 0.5
 set -e
 
 if [ "$SMOKE_OK" = "1" ]; then
@@ -364,8 +368,15 @@ cd -
 echo ""
 echo "💻 Step 8: Installing locally..."
 
-pkill -x "${APP_NAME}" 2>/dev/null && sleep 1 || true
-pkill -f "${APP_NAME}.app/Contents/Frameworks/Sparkle" 2>/dev/null || true
+# Em zsh com `set -e`, a forma `cmd && sleep || true` ainda pode abortar o
+# script porque o `&&` bloqueia o efeito do `||`. Encapsulamos tudo em set +e
+# pra garantir que pkill (que retorna 1 quando não há processo) nunca derrube
+# o deploy.
+set +e
+pkill -x "${APP_NAME}" >/dev/null 2>&1
+sleep 1
+pkill -f "${APP_NAME}.app/Contents/Frameworks/Sparkle" >/dev/null 2>&1
+set -e
 
 # CRÍTICO: copiamos o app já assinado, SEM re-rodar codesign. Re-assinar aqui
 # mudaria o cdhash e o macOS trataria como "outro app" → as permissões
@@ -388,6 +399,9 @@ if [ -f "$LSREGISTER" ]; then
     done
 
     # Unregister cada path que NÃO seja /Applications/${APP_NAME}.app.
+    # IMPORTANTE: `set -euo pipefail` faz o script abortar se `grep` não
+    # encontrar matches (exit 1) — desativamos pipefail só pra esse pipeline.
+    set +o pipefail
     "$LSREGISTER" -dump 2>/dev/null \
       | awk '/^----/{block=""} {block=block"\n"$0} /'"$BUNDLE_ID"'/ {print block; block=""}' \
       | grep -E "^path:" | awk '{print $2}' | sort -u | while IFS= read -r STALE; do
@@ -395,6 +409,7 @@ if [ -f "$LSREGISTER" ]; then
         [ "$STALE" = "/Applications/${APP_NAME}.app" ] && continue
         "$LSREGISTER" -u "$STALE" >/dev/null 2>&1 || true
     done
+    set -o pipefail
 
     # Limpa caches do Sparkle (Updater.app extraído de versões anteriores).
     rm -rf "$HOME/Library/Caches/${BUNDLE_ID}/org.sparkle-project.Sparkle/Launcher" 2>/dev/null

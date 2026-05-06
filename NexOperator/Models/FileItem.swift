@@ -13,6 +13,16 @@ enum FileItemType: String, Comparable {
     }
 }
 
+/// Marca um `FileItem` como entry virtual dentro de um archive. Permite à UI
+/// distinguir "arquivo real no filesystem" de "entry de zip que precisa
+/// extração antes de virar útil".
+struct ArchiveOrigin: Hashable {
+    let archiveURL: URL
+    /// Path POSIX dentro do archive (sem barra inicial). Ex: "src/main.swift".
+    let internalPath: String
+    let isDirectory: Bool
+}
+
 struct FileItem: Identifiable, Hashable {
     let id: String
     let url: URL
@@ -25,8 +35,37 @@ struct FileItem: Identifiable, Hashable {
     let tags: [String]
     let fileExtension: String
     let isDirectory: Bool
+    /// Quando o item representa uma entry **dentro de um archive** (não um
+    /// arquivo real no filesystem), guardamos o archive de origem + o path
+    /// interno. A maioria das operações destrutivas é desabilitada nesse
+    /// modo (rename, delete, move) porque o filesystem alvo é read-only.
+    let archiveOrigin: ArchiveOrigin?
+
+    /// Inicializador especial para entries dentro de um archive. Constrói
+    /// uma URL "virtual" baseada no archive + sub-path para manter a API
+    /// uniforme com items de filesystem real.
+    init(archiveEntry: ArchiveEntry, in archive: URL) {
+        let virtualURL = archive.appendingPathComponent(archiveEntry.path)
+        self.url = virtualURL
+        self.id = "archive://\(archive.path)#\(archiveEntry.path)"
+        self.name = archiveEntry.name
+        self.size = archiveEntry.size
+        self.createdDate = nil
+        self.modifiedDate = archiveEntry.modified
+        self.isHidden = archiveEntry.name.hasPrefix(".")
+        self.tags = []
+        self.fileExtension = (archiveEntry.name as NSString).pathExtension.lowercased()
+        self.isDirectory = archiveEntry.isDirectory
+        self.fileType = archiveEntry.isDirectory ? .folder : .file
+        self.archiveOrigin = ArchiveOrigin(
+            archiveURL: archive,
+            internalPath: archiveEntry.path,
+            isDirectory: archiveEntry.isDirectory
+        )
+    }
 
     init(url: URL) {
+        self.archiveOrigin = nil
         self.url = url
         self.id = url.path
         self.name = url.lastPathComponent
@@ -68,6 +107,14 @@ struct FileItem: Identifiable, Hashable {
     var isGitRepo: Bool {
         guard isDirectory else { return false }
         return FileManager.default.fileExists(atPath: url.appendingPathComponent(".git").path)
+    }
+
+    /// `true` quando o item é um arquivo de archive navegável (zip/rar/7z/tar).
+    /// Usado para decidir entre "abrir externamente" e "navegar dentro como
+    /// se fosse pasta", igual o Windows Explorer faz.
+    var isArchive: Bool {
+        guard !isDirectory else { return false }
+        return ArchiveKind.detect(from: url) != nil
     }
 
     var sfSymbol: String {
@@ -152,6 +199,16 @@ class FileItemProvider: ObservableObject {
     @Published var sortField: FileSortField = .name
     @Published var sortOrder: FileSortOrder = .ascending
     @Published var showHidden = false
+    /// Quando setado, o provider está navegando DENTRO de um archive em vez
+    /// do filesystem real. `currentURL` aponta para o archive (não muda); a
+    /// sub-pasta atual é determinada por `archiveLocation.subPath`.
+    @Published var archiveLocation: ArchiveLocation?
+    /// Cache das entries do archive atual — só listamos uma vez por
+    /// abertura do zip (listing pode ser caro em archives grandes).
+    private var archiveEntriesCache: [ArchiveEntry] = []
+
+    /// `true` quando o provider está em modo archive (read-only).
+    var isInsideArchive: Bool { archiveLocation != nil }
 
     private var watcher: DispatchSourceFileSystemObject?
     private var watcherFD: Int32 = -1
@@ -168,6 +225,13 @@ class FileItemProvider: ObservableObject {
     }
 
     func load() {
+        // Em modo archive, "carregar" significa re-renderizar a sub-pasta
+        // atual a partir do cache de entries — não tocamos no filesystem.
+        if isInsideArchive {
+            rebuildArchiveItems()
+            return
+        }
+
         isLoading = true
         error = nil
 
@@ -193,8 +257,99 @@ class FileItemProvider: ObservableObject {
 
     func navigate(to url: URL) {
         stopWatching()
+        // Sair de qualquer modo archive ao navegar pra path real.
+        archiveLocation = nil
+        archiveEntriesCache = []
         currentURL = url
         load()
+    }
+
+    // MARK: - Archive browsing
+
+    /// Entra em um archive (zip/rar/7z/tar...). Lista as entries uma vez e
+    /// passa a renderizar como se fosse uma pasta. Lança erro descritivo
+    /// quando a ferramenta CLI necessária não está instalada.
+    func enterArchive(_ archiveURL: URL) async throws {
+        guard let kind = ArchiveKind.detect(from: archiveURL) else {
+            throw ArchiveService.ArchiveError.unsupportedExtension
+        }
+        isLoading = true
+        error = nil
+        defer { isLoading = false }
+        let entries = try await ArchiveService.listEntries(in: archiveURL)
+        stopWatching()
+        archiveEntriesCache = entries
+        archiveLocation = ArchiveLocation(archiveURL: archiveURL, kind: kind, subPath: "")
+        // currentURL aponta pro archive em si — usado pelo path bar pra mostrar
+        // "/path/to/file.zip" como base. A sub-pasta interna fica em archiveLocation.
+        currentURL = archiveURL
+        rebuildArchiveItems()
+    }
+
+    /// Navega pra uma sub-pasta dentro do archive corrente. `subPath` vazio
+    /// = root do archive.
+    func navigateInsideArchive(toSubPath subPath: String) {
+        guard var loc = archiveLocation else { return }
+        loc.subPath = subPath
+        archiveLocation = loc
+        rebuildArchiveItems()
+    }
+
+    /// Sai do archive atual e volta para a pasta que o continha. Usado pelo
+    /// botão "voltar" e pelo "subir um nível" quando o usuário está no root.
+    func exitArchive() {
+        guard let loc = archiveLocation else { return }
+        let parent = loc.archiveURL.deletingLastPathComponent()
+        archiveLocation = nil
+        archiveEntriesCache = []
+        currentURL = parent
+        load()
+    }
+
+    /// Filtra `archiveEntriesCache` pra mostrar somente o que está
+    /// diretamente dentro de `archiveLocation.subPath`. Cria também as
+    /// "pseudo-pastas" implícitas (entries cujo path tem mais níveis mas
+    /// cujos diretórios pais não foram listados explicitamente).
+    private func rebuildArchiveItems() {
+        guard let loc = archiveLocation else { return }
+        let prefix = loc.subPath.isEmpty ? "" : loc.subPath + "/"
+
+        // Entries diretas: aquelas cujo path começa com o prefix e não tem
+        // mais nenhuma `/` depois.
+        var direct: [FileItem] = []
+        var implicitDirs: Set<String> = []
+
+        for entry in archiveEntriesCache {
+            guard entry.path.hasPrefix(prefix) || prefix.isEmpty else { continue }
+            let relative = String(entry.path.dropFirst(prefix.count))
+            if relative.isEmpty { continue }
+            if let slashIndex = relative.firstIndex(of: "/") {
+                // Está em sub-nível — extrai o primeiro segmento como pasta implícita.
+                let firstSegment = String(relative[..<slashIndex])
+                if firstSegment.isEmpty { continue }
+                implicitDirs.insert(firstSegment)
+            } else {
+                // Entry direta. Se vier marcada como diretório, registra
+                // também via implicitDirs pra evitar duplicidade abaixo.
+                if entry.isDirectory {
+                    implicitDirs.insert(relative)
+                } else {
+                    direct.append(FileItem(archiveEntry: entry, in: loc.archiveURL))
+                }
+            }
+        }
+
+        // Cria FileItems pras pastas implícitas.
+        for dirName in implicitDirs {
+            let fullPath = prefix + dirName
+            let dirEntry = ArchiveEntry(
+                path: fullPath, isDirectory: true, size: 0, modified: nil
+            )
+            direct.append(FileItem(archiveEntry: dirEntry, in: loc.archiveURL))
+        }
+
+        items = direct
+        sortItems()
     }
 
     func sortItems() {
